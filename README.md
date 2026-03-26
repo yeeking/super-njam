@@ -13,7 +13,7 @@ python3 -m venv .venv
 Stage 1: corpus export and NJam/MIDI conversion:
 
 ```bash
-.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus.jsonl --limit 32
+.venv/bin   
 .venv/bin/python python/7_midi_and_njam.py midi-demo --in "data/midi/ArtPepper_Anthropology_FINAL.mid" --out-dir outputs --render-audio --soundfont soundfonts/soundfont.sf2
 ```
 

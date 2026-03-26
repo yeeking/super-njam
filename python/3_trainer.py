@@ -47,37 +47,37 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
+        default=16,
         help="Training batch size per optimization step. Expected range: 1-64 depending on memory; 1-8 is typical on small local runs.",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum token sequence length used for training chunks. Expected range: 64-4096; larger values require more memory.",
     )
     parser.add_argument(
         "--num-layers",
         type=int,
-        default=4,
+        default=8,
         help="Number of transformer decoder layers. Expected range: 2-32 for this project; higher values increase capacity and training cost.",
     )
     parser.add_argument(
         "--hidden-size",
         type=int,
-        default=128,
+        default=256,
         help="Transformer hidden width. Expected range: 64-2048; it should be divisible by --num-heads.",
     )
     parser.add_argument(
         "--num-heads",
         type=int,
-        default=4,
+        default=8,
         help="Number of attention heads. Expected range: 1-32; must divide --hidden-size evenly.",
     )
     parser.add_argument(
         "--intermediate-size",
         type=int,
-        default=256,
+        default=512,
         help="Feed-forward network width inside each transformer block. Expected range: at least --hidden-size and commonly 2x-8x hidden size.",
     )
     parser.add_argument(
