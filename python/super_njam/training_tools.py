@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -404,15 +405,36 @@ def _read_wav_mono(path: Path) -> List[float]:
     return data.tolist()
 
 
+def configure_torch_runtime() -> None:
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = True
+
+
 def detect_accelerator() -> Dict[str, object]:
     if torch.cuda.is_available():
-        return {"accelerator": "gpu", "devices": 1}
+        return {"accelerator": "gpu", "devices": 1, "precision": "16-mixed"}
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return {"accelerator": "mps", "devices": 1}
-    return {"accelerator": "cpu", "devices": 1}
+        return {"accelerator": "mps", "devices": 1, "precision": "32-true"}
+    return {"accelerator": "cpu", "devices": 1, "precision": "32-true"}
+
+
+def dataloader_kwargs() -> Dict[str, object]:
+    if torch.cuda.is_available():
+        num_workers = min(4, os.cpu_count() or 1)
+        return {
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "persistent_workers": num_workers > 0,
+        }
+    return {"num_workers": 0, "pin_memory": False}
 
 
 def run_training(config: TrainConfig) -> Dict[str, object]:
+    configure_torch_runtime()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     records = load_corpus_records(config.corpus_path)
     splits = split_records_by_solo(records)
@@ -453,8 +475,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     )
     trainer.fit(
         module,
-        DataLoader(train_ds, batch_size=config.batch_size, shuffle=True),
-        DataLoader(val_ds, batch_size=config.batch_size),
+        DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, **dataloader_kwargs()),
+        DataLoader(val_ds, batch_size=config.batch_size, **dataloader_kwargs()),
     )
     hf_dir = config.output_dir / "hf_model"
     hf_dir.mkdir(parents=True, exist_ok=True)
