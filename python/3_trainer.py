@@ -4,10 +4,31 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 
 from super_njam.training_tools import TrainConfig, run_training
+
+
+def _format_float_token(value: float) -> str:
+    token = f"{value:.0e}" if value < 1e-3 else f"{value:g}"
+    return token.replace("+", "").replace(".", "p")
+
+
+def _default_output_dir(args: argparse.Namespace) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = (
+        f"l{args.num_layers}_"
+        f"h{args.hidden_size}_"
+        f"heads{args.num_heads}_"
+        f"ff{args.intermediate_size}_"
+        f"seq{args.seq_len}_"
+        f"bs{args.batch_size}_"
+        f"lr{_format_float_token(args.learning_rate)}_"
+        f"{timestamp}"
+    )
+    return Path("artifacts") / run_name
 
 
 def main() -> None:
@@ -21,8 +42,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
-        help="Directory for checkpoints, TensorBoard logs, tokenizer files, and sample outputs. Expected: a writable directory path.",
+        help="Directory for checkpoints, TensorBoard logs, tokenizer files, and sample outputs. Expected: a writable directory path. If omitted, the trainer creates artifacts/<config>_<timestamp> automatically.",
     )
     parser.add_argument(
         "--batch-size",
@@ -85,6 +105,17 @@ def main() -> None:
         help="Number of held-out prompt continuations to render during evaluation. Expected range: 1-32 for routine runs.",
     )
     parser.add_argument(
+        "--sample-every-n-epochs",
+        type=int,
+        default=1,
+        help="How often to generate validation examples. Expected range: integers >= 1, where 1 means every epoch and 5 means every 5 epochs.",
+    )
+    parser.add_argument(
+        "--dataset-prep-workers",
+        type=int,
+        help="Worker count for sliding-window dataset preparation after tokenizer training. Expected range: 1-32 on most machines. If omitted, the trainer chooses a default automatically.",
+    )
+    parser.add_argument(
         "--soundfont",
         type=Path,
         default=Path("soundfonts/SGM-v2.01-YamahaGrand-Guit-Bass-v2.7.sf2"),
@@ -97,9 +128,10 @@ def main() -> None:
         help="Instrument patch used for rendered training samples. Expected values: names such as saxophone, alto_sax, tenor_sax, piano, trumpet, or clarinet. Default: saxophone.",
     )
     args = parser.parse_args()
+    output_dir = args.output_dir if args.output_dir is not None else _default_output_dir(args)
     config = TrainConfig(
         corpus_path=args.corpus,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         num_layers=args.num_layers,
@@ -110,10 +142,13 @@ def main() -> None:
         learning_rate=args.learning_rate,
         sample_prompt_ratio=args.sample_prompt_ratio,
         sample_limit=args.sample_limit,
+        sample_every_n_epochs=args.sample_every_n_epochs,
+        dataset_prep_workers=args.dataset_prep_workers,
         soundfont_path=args.soundfont,
         render_instrument=args.instrument,
     )
     summary = run_training(config)
+    summary["resolved_output_dir"] = str(output_dir)
     print(json.dumps(summary, indent=2, default=str))
 
 

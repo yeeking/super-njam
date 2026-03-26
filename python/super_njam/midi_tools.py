@@ -49,7 +49,14 @@ def resolve_midi_program(metadata: Dict[str, str]) -> Optional[int]:
     return INSTRUMENT_PROGRAMS.get(instrument)
 
 
-def njam_to_midi(document: NJamDocument) -> mido.MidiFile:
+def note_duration_limit_ticks(document: NJamDocument, max_note_seconds: float) -> int:
+    assert max_note_seconds > 0, "max_note_seconds must be positive."
+    tempo_bpm = float(document.metadata.get("tempo", "120.0"))
+    ticks_per_second = document.ppq * (tempo_bpm / 60.0)
+    return max(1, int(round(max_note_seconds * ticks_per_second)))
+
+
+def njam_to_midi(document: NJamDocument, max_note_seconds: float | None = None) -> mido.MidiFile:
     ticks_per_beat = document.ppq
     midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
     meta_track = mido.MidiTrack()
@@ -73,14 +80,16 @@ def njam_to_midi(document: NJamDocument) -> mido.MidiFile:
     if program is not None:
         note_track.append(mido.Message("program_change", program=program, time=0))
 
+    max_note_ticks = None if max_note_seconds is None else note_duration_limit_ticks(document, max_note_seconds)
     absolute_messages: List[Tuple[int, mido.Message]] = []
     for event in document.sorted_events():
         if isinstance(event, NoteEvent):
+            duration = event.duration if max_note_ticks is None else min(event.duration, max_note_ticks)
             absolute_messages.append(
                 (event.time, mido.Message("note_on", note=event.pitch, velocity=event.velocity, time=0))
             )
             absolute_messages.append(
-                (event.time + event.duration, mido.Message("note_off", note=event.pitch, velocity=0, time=0))
+                (event.time + duration, mido.Message("note_off", note=event.pitch, velocity=0, time=0))
             )
         elif isinstance(event, PitchBendEvent):
             absolute_messages.append((event.time, mido.Message("pitchwheel", pitch=event.value, time=0)))
@@ -105,8 +114,8 @@ def njam_to_midi(document: NJamDocument) -> mido.MidiFile:
     return midi
 
 
-def write_midi(document: NJamDocument, output_path: Path) -> None:
-    midi = njam_to_midi(document)
+def write_midi(document: NJamDocument, output_path: Path, max_note_seconds: float | None = None) -> None:
+    midi = njam_to_midi(document, max_note_seconds=max_note_seconds)
     midi.save(str(output_path))
 
 

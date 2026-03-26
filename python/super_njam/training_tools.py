@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -18,11 +20,27 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, Dataset
 from transformers import LlamaConfig, LlamaForCausalLM
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
+
 from .audio_tools import render_document_audio
 from .midi_tools import write_midi
-from .njam_v3 import NJamDocument, encode_document, parse_document
+from .njam_v3 import (
+    ControlChangeEvent,
+    NJamDocument,
+    NoteEvent,
+    PitchBendEvent,
+    analyze_parseable_continuation,
+    encode_document,
+    extract_header_metadata,
+    parse_document,
+    recover_continuation_document,
+)
 
 DEFAULT_TRAINING_SOUNDFONT = Path("soundfonts/SGM-v2.01-YamahaGrand-Guit-Bass-v2.7.sf2")
+MAX_SAMPLE_NOTE_SECONDS = 10.0
 
 
 def load_corpus_records(corpus_path: Path) -> List[Dict[str, object]]:
@@ -76,7 +94,7 @@ def build_sentencepiece_tokenizer(
         eos_id=2,
         unk_id=0,
         hard_vocab_limit=False,
-        max_sentence_length=65536,
+        max_sentence_length=1048576,
         byte_fallback=True,
     )
     return SentencePieceTokenizerAdapter(Path(str(model_prefix) + ".model"))
@@ -153,29 +171,136 @@ class SentencePieceTokenizerAdapter:
         )
 
 
-class PackedCausalDataset(Dataset):
-    def __init__(self, texts: Sequence[str], tokenizer: SentencePieceTokenizerAdapter, seq_len: int):
-        assert texts, "PackedCausalDataset requires non-empty texts."
+def njam_body_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("NV3|"):
+        return stripped
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        return "\n".join(lines[1:]).strip()
+    body_match = re.search(r"\sT[-0-9A-Z]+", stripped)
+    assert body_match is not None, "NJam text must contain body tokens after the header."
+    return stripped[body_match.start() :].strip()
+
+
+def njam_header_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("NV3|"):
+        return ""
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if lines:
+        return lines[0]
+    body_match = re.search(r"\sT[-0-9A-Z]+", stripped)
+    assert body_match is not None, "NJam text must contain body tokens after the header."
+    return stripped[: body_match.start()].strip()
+
+
+def _prepare_solo_token_ids(
+    text: str,
+    tokenizer_model_path: str,
+    bos_token_id: int,
+    eos_token_id: int,
+) -> Tuple[List[int], int]:
+    processor = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
+    body_text = njam_body_text(text)
+    token_ids = [bos_token_id] + list(processor.encode(body_text, out_type=int)) + [eos_token_id]
+    assert len(token_ids) >= 2, "Each solo must yield at least one next-token target."
+    return token_ids, len(token_ids) - 1
+
+
+def _build_dataset_executor(max_workers: int):
+    try:
+        return ProcessPoolExecutor(max_workers=max_workers), "process"
+    except Exception:
+        return ThreadPoolExecutor(max_workers=max_workers), "thread"
+
+
+class SoloSlidingWindowDataset(Dataset):
+    def __init__(
+        self,
+        texts: Sequence[str],
+        tokenizer: SentencePieceTokenizerAdapter,
+        seq_len: int,
+        split_name: str = "dataset",
+        prep_workers: Optional[int] = None,
+    ):
+        assert texts, "SoloSlidingWindowDataset requires non-empty texts."
         bos = tokenizer.bos_token_id
         eos = tokenizer.eos_token_id
         assert bos is not None and eos is not None, "Tokenizer must define BOS and EOS tokens."
-        token_ids: List[int] = []
-        for text in texts:
-            token_ids.extend([bos] + tokenizer.encode(text, add_special_tokens=False) + [eos])
-        assert len(token_ids) > seq_len, "Not enough tokens for the requested sequence length."
-        self.chunks = []
-        for start in range(0, len(token_ids) - seq_len, seq_len):
-            chunk = token_ids[start : start + seq_len + 1]
-            if len(chunk) == seq_len + 1:
-                self.chunks.append(torch.tensor(chunk, dtype=torch.long))
-        assert self.chunks, "Token packing produced zero chunks."
+        self.seq_len = seq_len
+        self.pad_token_id = eos
+        self.solo_token_ids: List[List[int]] = []
+        self.windows: List[Tuple[int, int]] = []
+        self.window_counts_per_solo: List[int] = []
+        progress = (
+            tqdm(total=len(texts), desc=f"Preparing {split_name} windows", unit="solo", leave=False, dynamic_ncols=True)
+            if tqdm is not None
+            else None
+        )
+        worker_count = 1 if prep_workers is None else min(len(texts), max(1, int(prep_workers)))
+        if worker_count <= 1:
+            for text in texts:
+                token_ids, solo_window_count = _prepare_solo_token_ids(
+                    text=text,
+                    tokenizer_model_path=str(tokenizer.model_path),
+                    bos_token_id=bos,
+                    eos_token_id=eos,
+                )
+                solo_idx = len(self.solo_token_ids)
+                self.solo_token_ids.append(token_ids)
+                self.windows.extend((solo_idx, end_idx) for end_idx in range(solo_window_count))
+                self.window_counts_per_solo.append(solo_window_count)
+                if progress is not None:
+                    progress.update(1)
+        else:
+            ordered_results: List[Optional[Tuple[List[int], int]]] = [None] * len(texts)
+            executor, executor_kind = _build_dataset_executor(worker_count)
+            print(f"Preparing {split_name} windows with {executor_kind} pool ({worker_count} workers)")
+            with executor:
+                future_to_index = {
+                    executor.submit(
+                        _prepare_solo_token_ids,
+                        text,
+                        str(tokenizer.model_path),
+                        bos,
+                        eos,
+                    ): idx
+                    for idx, text in enumerate(texts)
+                }
+                for future in as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    ordered_results[idx] = future.result()
+                    if progress is not None:
+                        progress.update(1)
+            for result in ordered_results:
+                assert result is not None
+                token_ids, solo_window_count = result
+                solo_idx = len(self.solo_token_ids)
+                self.solo_token_ids.append(token_ids)
+                self.windows.extend((solo_idx, end_idx) for end_idx in range(solo_window_count))
+                self.window_counts_per_solo.append(solo_window_count)
+        if progress is not None:
+            progress.close()
+        assert self.windows, "Sliding window construction produced zero samples."
 
     def __len__(self) -> int:
-        return len(self.chunks)
+        return len(self.windows)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        chunk = self.chunks[idx]
-        return {"input_ids": chunk[:-1], "labels": chunk[1:]}
+        solo_idx, end_idx = self.windows[idx]
+        token_ids = self.solo_token_ids[solo_idx]
+        chunk = token_ids[max(0, end_idx - self.seq_len + 1) : end_idx + 2]
+        left_pad = (self.seq_len + 1) - len(chunk)
+        padded = ([self.pad_token_id] * left_pad) + chunk
+        input_ids = torch.tensor(padded[:-1], dtype=torch.long)
+        attention_mask = torch.ones(self.seq_len, dtype=torch.long)
+        if left_pad > 0:
+            attention_mask[:left_pad] = 0
+        labels = torch.tensor(padded[1:], dtype=torch.long)
+        if left_pad > 0:
+            labels[:left_pad] = -100
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 @dataclass
@@ -192,6 +317,8 @@ class TrainConfig:
     learning_rate: float = 3e-4
     sample_prompt_ratio: float = 0.35
     sample_limit: int = 2
+    sample_every_n_epochs: int = 1
+    dataset_prep_workers: Optional[int] = None
     soundfont_path: Optional[Path] = DEFAULT_TRAINING_SOUNDFONT
     render_instrument: str = "saxophone"
 
@@ -228,12 +355,27 @@ class NJamLightningModule(L.LightningModule):
         tokens = text.split()
         return " ".join(tokens[: max(8, int(len(tokens) * self.cfg.sample_prompt_ratio))])
 
-    def _generate_sample_text(self, prompt: str) -> Tuple[str, str]:
-        encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    def _truncate_prompt_to_context_budget(self, prompt: str, reserved_new_tokens: int) -> str:
+        max_positions = int(self.model.config.max_position_embeddings)
+        max_prompt_tokens = max(1, max_positions - reserved_new_tokens - 1)
+        if len(self.tokenizer.encode(prompt, add_special_tokens=False)) <= max_prompt_tokens:
+            return prompt
+        body_tokens = prompt.split()
+        for start_idx in range(len(body_tokens)):
+            candidate = " ".join(body_tokens[start_idx:]).strip()
+            if candidate and len(self.tokenizer.encode(candidate, add_special_tokens=False)) <= max_prompt_tokens:
+                return candidate
+        return body_tokens[-1] if body_tokens else prompt.strip()
+
+    def _generate_sample_text(self, prompt: str) -> Tuple[str, str, str]:
+        max_positions = int(self.model.config.max_position_embeddings)
+        target_new_tokens = min(64, max(1, max_positions - 2))
+        effective_prompt = self._truncate_prompt_to_context_budget(prompt, target_new_tokens)
+        encoded = self.tokenizer(effective_prompt, return_tensors="pt", add_special_tokens=False)
         encoded.pop("token_type_ids", None)
+        encoded["attention_mask"] = torch.ones_like(encoded["input_ids"])
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
         input_length = int(encoded["input_ids"].shape[1])
-        max_positions = int(self.model.config.max_position_embeddings)
         max_new_tokens = min(64, max(1, max_positions - input_length - 1))
         with torch.no_grad():
             generated = self.model.generate(
@@ -246,21 +388,60 @@ class NJamLightningModule(L.LightningModule):
         full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
         continuation_ids = generated[0][input_length:]
         continuation_text = self.tokenizer.decode(continuation_ids, skip_special_tokens=True)
-        return full_text, continuation_text
+        return effective_prompt, full_text, continuation_text
 
     def _write_sample_midi(self, document, midi_path: Path) -> None:
         render_doc = NJamDocument(
             metadata={**document.metadata, "render_instrument": self.cfg.render_instrument},
             events=list(document.events),
         )
-        write_midi(render_doc, midi_path)
+        write_midi(render_doc, midi_path, max_note_seconds=MAX_SAMPLE_NOTE_SECONDS)
 
-    def _write_sample_audio(self, document, wav_path: Path) -> None:
+    def _sanitize_document_for_audio_render(self, document: NJamDocument) -> NJamDocument:
+        ppq = int(document.metadata.get("ppq", "96"))
+        max_time = ppq * 32
+        tempo_bpm = float(document.metadata.get("tempo", "120.0"))
+        max_duration = max(1, int(round(MAX_SAMPLE_NOTE_SECONDS * ppq * (tempo_bpm / 60.0))))
+        sanitized_events = []
+        for event in document.events:
+            event_time = min(int(event.time), max_time)
+            if isinstance(event, NoteEvent):
+                sanitized_events.append(
+                    NoteEvent(
+                        time=event_time,
+                        pitch=event.pitch,
+                        velocity=event.velocity,
+                        duration=max(1, min(int(event.duration), max_duration)),
+                    )
+                )
+            elif isinstance(event, ControlChangeEvent):
+                sanitized_events.append(
+                    ControlChangeEvent(time=event_time, control=event.control, value=event.value)
+                )
+            elif isinstance(event, PitchBendEvent):
+                sanitized_events.append(PitchBendEvent(time=event_time, value=event.value))
+        return NJamDocument(metadata=dict(document.metadata), events=sanitized_events)
+
+    def _write_sample_audio(self, document, wav_path: Path) -> bool:
         render_doc = NJamDocument(
             metadata={**document.metadata, "render_instrument": self.cfg.render_instrument},
             events=list(document.events),
         )
-        render_document_audio(render_doc, wav_path, soundfont_path=self.cfg.soundfont_path)
+        try:
+            render_document_audio(render_doc, wav_path, soundfont_path=self.cfg.soundfont_path)
+        except Exception:
+            try:
+                sanitized_doc = self._sanitize_document_for_audio_render(render_doc)
+                render_document_audio(sanitized_doc, wav_path, soundfont_path=self.cfg.soundfont_path)
+            except Exception:
+                if wav_path.exists():
+                    wav_path.unlink()
+                return False
+        if not wav_path.exists() or wav_path.stat().st_size <= 44:
+            if wav_path.exists():
+                wav_path.unlink()
+            return False
+        return True
 
     def _write_render_bundle(self, document, epoch: int, sample_idx: int, label: str, text_out: str) -> Dict[str, str]:
         njam_path = self._artifact_path(epoch, sample_idx, label, "njam")
@@ -268,18 +449,22 @@ class NJamLightningModule(L.LightningModule):
         wav_path = self._artifact_path(epoch, sample_idx, label, "wav")
         njam_path.write_text(text_out, encoding="utf-8")
         self._write_sample_midi(document, midi_path)
-        self._write_sample_audio(document, wav_path)
-        return {
+        paths = {
             "njam": str(njam_path),
             "midi": str(midi_path),
-            "wav": str(wav_path),
         }
+        if self._write_sample_audio(document, wav_path):
+            paths["wav"] = str(wav_path)
+        return paths
 
     def _log_sample_audio(self, wav_path: Path, sample_idx: int) -> None:
         logger = self.logger.experiment if self.logger else None
         if logger is None or not wav_path.exists():
             return
-        audio_tensor = torch.tensor(_read_wav_mono(wav_path), dtype=torch.float32).unsqueeze(0)
+        try:
+            audio_tensor = torch.tensor(_read_wav_mono(wav_path), dtype=torch.float32).unsqueeze(0)
+        except Exception:
+            return
         logger.add_audio(f"samples_audio/sample_{sample_idx}", audio_tensor, self.current_epoch, sample_rate=22050)
 
     def _log_sample_text(self, sample_idx: int, text_out: str, model_only_text: str) -> None:
@@ -293,9 +478,21 @@ class NJamLightningModule(L.LightningModule):
         if logger is not None:
             logger.add_text(f"samples/sample_{sample_idx}_error", str(exc), self.current_epoch)
 
+    def _log_sample_metrics(self, sample_idx: int, stats: Dict[str, float | int]) -> None:
+        logger = self.logger.experiment if self.logger else None
+        if logger is not None:
+            for key, value in stats.items():
+                logger.add_scalar(f"samples_metrics/generated_model_only_{key}_{sample_idx}", value, self.current_epoch)
+
     def _write_sample_summary(self, sample_idx: int, payload: Dict[str, object]) -> None:
         summary_path = self._artifact_path(self.current_epoch, sample_idx, "summary", "json")
         summary_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+
+    def _remove_render_bundle(self, paths: Dict[str, str]) -> None:
+        for path_str in paths.values():
+            path = Path(path_str)
+            if path.exists():
+                path.unlink()
 
     def _slice_model_only_document(self, generated_doc: NJamDocument, prompt: str) -> Optional[NJamDocument]:
         prompt_doc = parse_document(prompt)
@@ -310,6 +507,30 @@ class NJamLightningModule(L.LightningModule):
             rebased_time = event.time - start_time
             rebased_events.append(event.__class__(**{**event.__dict__, "time": rebased_time}))
         return NJamDocument(metadata=dict(generated_doc.metadata), events=rebased_events)
+
+    def _recover_model_only_document(self, prompt: str, model_only_text: str) -> Optional[NJamDocument]:
+        metadata = extract_header_metadata(prompt)
+        return recover_continuation_document(model_only_text, metadata=metadata)
+
+    def _write_model_only_render_bundle(
+        self,
+        sample_idx: int,
+        document: NJamDocument,
+        summary: Dict[str, object],
+        render_mode: str,
+    ) -> None:
+        model_only_paths = self._write_render_bundle(
+            document,
+            self.current_epoch,
+            sample_idx,
+            "generated_model_only",
+            encode_document(document),
+        )
+        summary["generated_model_only_parse_ok"] = True
+        summary["generated_model_only_paths"] = model_only_paths
+        summary["generated_model_only_render_mode"] = render_mode
+        if "wav" in model_only_paths:
+            self._log_sample_audio(Path(model_only_paths["wav"]), sample_idx)
 
     def _write_reference_once(self, sample_idx: int, text: str, summary: Dict[str, object]) -> None:
         if self.current_epoch != 0:
@@ -329,44 +550,53 @@ class NJamLightningModule(L.LightningModule):
 
     def _render_validation_sample(self, sample_idx: int, sample: Dict[str, object]) -> None:
         text = str(sample["text"])
-        prompt = self._build_prompt(text)
-        full_text, model_only_text = self._generate_sample_text(prompt)
-        self._log_sample_text(sample_idx, full_text, model_only_text)
+        body_text = njam_body_text(text)
+        prompt = self._build_prompt(body_text)
+        effective_prompt, full_body_text, model_only_text = self._generate_sample_text(prompt)
+        self._log_sample_text(sample_idx, full_body_text, model_only_text)
+        model_only_recovery_stats = analyze_parseable_continuation(model_only_text).to_dict()
+        self._log_sample_metrics(sample_idx, model_only_recovery_stats)
+        header_text = njam_header_text(text)
+        generated_text = header_text + "\n" + full_body_text.strip() + "\n"
         summary: Dict[str, object] = {
             "epoch": int(self.current_epoch),
             "sample_idx": int(sample_idx),
-            "prompt": prompt,
-            "generated_text_preview": full_text[:500],
+            "prompt": effective_prompt,
+            "generated_text_preview": full_body_text[:500],
             "generated_model_only_preview": model_only_text[:500],
+            "generated_model_only_recovery_stats": model_only_recovery_stats,
             "generated_parse_ok": False,
             "generated_model_only_parse_ok": False,
         }
         try:
-            generated_doc = parse_document(full_text)
-            generated_paths = self._write_render_bundle(generated_doc, self.current_epoch, sample_idx, "generated_full", full_text)
+            generated_doc = parse_document(generated_text)
             summary["generated_parse_ok"] = True
-            summary["generated_full_paths"] = generated_paths
-            self._log_sample_audio(Path(generated_paths["wav"]), sample_idx)
-            model_only_doc = self._slice_model_only_document(generated_doc, prompt)
+            prompt_text = header_text + "\n" + effective_prompt.strip() + "\n"
+            model_only_doc = self._slice_model_only_document(generated_doc, prompt_text)
             if model_only_doc is not None and model_only_doc.events:
-                model_only_paths = self._write_render_bundle(
-                    model_only_doc,
+                generated_paths = self._write_render_bundle(
+                    generated_doc,
                     self.current_epoch,
                     sample_idx,
-                    "generated_model_only",
-                    encode_document(model_only_doc),
+                    "generated_full",
+                    generated_text,
                 )
-                summary["generated_model_only_parse_ok"] = True
-                summary["generated_model_only_paths"] = model_only_paths
+                summary["generated_full_paths"] = generated_paths
+                self._write_model_only_render_bundle(sample_idx, model_only_doc, summary, render_mode="strict")
+            else:
+                recovered_model_only_doc = self._recover_model_only_document(text, model_only_text)
+                if recovered_model_only_doc is not None and recovered_model_only_doc.events:
+                    self._write_model_only_render_bundle(sample_idx, recovered_model_only_doc, summary, render_mode="recovered")
+                else:
+                    summary["generated_error"] = "Model output parsed, but no standalone parseable model-only continuation remained after trimming the prompt."
         except Exception as exc:
-            raw_generated_path = self._artifact_path(self.current_epoch, sample_idx, "generated_raw", "txt")
-            raw_generated_path.write_text(full_text, encoding="utf-8")
-            raw_model_only_path = self._artifact_path(self.current_epoch, sample_idx, "generated_model_only_raw", "txt")
-            raw_model_only_path.write_text(model_only_text, encoding="utf-8")
-            summary["generated_error"] = str(exc)
-            summary["generated_raw_path"] = str(raw_generated_path)
-            summary["generated_model_only_raw_path"] = str(raw_model_only_path)
-            self._log_sample_error(sample_idx, exc)
+            recovered_model_only_doc = self._recover_model_only_document(text, model_only_text)
+            if recovered_model_only_doc is not None and recovered_model_only_doc.events:
+                self._write_model_only_render_bundle(sample_idx, recovered_model_only_doc, summary, render_mode="recovered")
+                summary["generated_error"] = str(exc)
+            else:
+                summary["generated_error"] = str(exc)
+                self._log_sample_error(sample_idx, exc)
         self._write_reference_once(sample_idx, text, summary)
         self._write_sample_summary(sample_idx, summary)
 
@@ -388,6 +618,9 @@ class NJamLightningModule(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         if not self.val_samples:
+            return
+        assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
+        if self.current_epoch % self.cfg.sample_every_n_epochs != 0:
             return
         for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
             self._render_validation_sample(idx, sample)
@@ -439,10 +672,29 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     records = load_corpus_records(config.corpus_path)
     splits = split_records_by_solo(records)
     tokenizer_dir = config.output_dir / "tokenizer"
-    tokenizer = build_sentencepiece_tokenizer([record["text"] for record in splits["train"]], tokenizer_dir)
+    tokenizer = build_sentencepiece_tokenizer([njam_body_text(str(record["text"])) for record in splits["train"]], tokenizer_dir)
     tokenizer.save_pretrained(str(tokenizer_dir))
-    train_ds = PackedCausalDataset([r["text"] for r in splits["train"]], tokenizer, config.seq_len)
-    val_ds = PackedCausalDataset([r["text"] for r in splits["val"]], tokenizer, config.seq_len)
+    train_ds = SoloSlidingWindowDataset(
+        [str(r["text"]) for r in splits["train"]],
+        tokenizer,
+        config.seq_len,
+        split_name="train",
+        prep_workers=config.dataset_prep_workers,
+    )
+    val_ds = SoloSlidingWindowDataset(
+        [str(r["text"]) for r in splits["val"]],
+        tokenizer,
+        config.seq_len,
+        split_name="val",
+        prep_workers=config.dataset_prep_workers,
+    )
+    test_ds = SoloSlidingWindowDataset(
+        [str(r["text"]) for r in splits["test"]],
+        tokenizer,
+        config.seq_len,
+        split_name="test",
+        prep_workers=config.dataset_prep_workers,
+    )
 
     model_cfg = LlamaConfig(
         vocab_size=tokenizer.vocab_size,
@@ -461,9 +713,12 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     logger = TensorBoardLogger(save_dir=str(config.output_dir), name="tensorboard")
     checkpoint = ModelCheckpoint(
         dirpath=str(config.output_dir / "checkpoints"),
+        filename="best",
         save_top_k=1,
+        save_last=False,
         monitor="val_loss",
         mode="min",
+        save_on_train_epoch_end=False,
     )
     trainer = L.Trainer(
         max_epochs=config.max_epochs,
@@ -485,8 +740,18 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     summary = {
         "best_model_path": checkpoint.best_model_path,
         "hf_model_dir": str(hf_dir),
-        "train_chunks": len(train_ds),
-        "val_chunks": len(val_ds),
+        "dataset_mode": "solo_sliding",
+        "train_windows": len(train_ds),
+        "val_windows": len(val_ds),
+        "test_windows": len(test_ds),
+        "mean_train_windows_per_solo": (sum(train_ds.window_counts_per_solo) / len(train_ds.window_counts_per_solo)),
+        "mean_val_windows_per_solo": (sum(val_ds.window_counts_per_solo) / len(val_ds.window_counts_per_solo)),
+        "mean_test_windows_per_solo": (sum(test_ds.window_counts_per_solo) / len(test_ds.window_counts_per_solo)),
+        "window_stride": 1,
+        "header_tokens_dropped": True,
+        "left_padding": True,
+        "pad_loss_masked": True,
+        "dataset_prep_workers": config.dataset_prep_workers,
         "tokenizer_dir": str(config.output_dir / "tokenizer"),
         "config": asdict(config),
     }

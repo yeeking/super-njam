@@ -10,8 +10,12 @@ from super_njam.njam_v3 import (
     NJamDocument,
     NoteEvent,
     PitchBendEvent,
+    analyze_parseable_continuation,
+    count_parseable_continuation_events,
     encode_document,
+    extract_header_metadata,
     parse_document,
+    recover_continuation_document,
 )
 from super_njam.weimar_db import export_corpus_jsonl, load_solo, weimar_to_njam
 
@@ -160,6 +164,49 @@ class RealMidiWorkflowTests(unittest.TestCase):
 
 
 class ParserRecoveryMidiTests(unittest.TestCase):
+    def test_extract_header_metadata_recovers_header_from_single_line_prompt(self) -> None:
+        metadata = extract_header_metadata("NV3|ppq=96|tempo=120|sig=4/4 T0 N1Y,3C,11")
+        self.assertEqual(metadata["ppq"], "96")
+        self.assertEqual(metadata["tempo"], "120")
+        self.assertEqual(metadata["sig"], "4/4")
+
+    def test_analyze_parseable_continuation_reports_defaults_and_quality(self) -> None:
+        stats = analyze_parseable_continuation("T0 N1Y T1 C1 T1 B T2 NZZ,ZZ,0").to_dict()
+        self.assertEqual(stats["event_candidates"], 4)
+        self.assertEqual(stats["events_recovered"], 4)
+        self.assertEqual(stats["default_injections"], 4)
+        self.assertEqual(stats["clamped_fields"], 3)
+        self.assertEqual(stats["recovered_field_count"], 9)
+        self.assertEqual(stats["hard_failures"], 0)
+        self.assertAlmostEqual(stats["field_correctness"], 2.0 / 9.0)
+        self.assertAlmostEqual(stats["quality_score"], 8.0 / 9.0)
+
+    def test_analyze_parseable_continuation_counts_hard_failures(self) -> None:
+        stats = analyze_parseable_continuation("T0 N- T1 C1,2O T1 B").to_dict()
+        self.assertEqual(stats["event_candidates"], 3)
+        self.assertEqual(stats["events_recovered"], 2)
+        self.assertEqual(stats["hard_failures"], 1)
+
+    def test_count_parseable_continuation_events_counts_valid_event_tokens(self) -> None:
+        text = "garbage T0 N1Y,3C,11 junk T1 C1 T1 B TQ bad T2 N20"
+        self.assertEqual(count_parseable_continuation_events(text), 4)
+
+    def test_count_parseable_continuation_events_ignores_event_tokens_without_time(self) -> None:
+        text = "N1Y,3C,11 C1,2O B0 T0 N20"
+        self.assertEqual(count_parseable_continuation_events(text), 1)
+
+    def test_recover_continuation_document_renders_partial_generated_text(self) -> None:
+        document = recover_continuation_document(
+            "01 T C,1 T C,1 TB C,1 TJB1,2 THB15A8888 BR T C,1 TB2BYBC T",
+            metadata={"ppq": "96", "tempo": "120", "sig": "4/4"},
+        )
+        self.assertIsNotNone(document)
+        assert document is not None
+        self.assertGreaterEqual(len(document.events), 1)
+        midi = njam_to_midi(document)
+        non_meta = [msg for track in midi.tracks for msg in track if not msg.is_meta]
+        self.assertTrue(non_meta)
+
     def test_render_instrument_metadata_emits_program_change(self) -> None:
         document = parse_document("NV3|ppq=96|tempo=120|sig=4/4|render_instrument=saxophone\nT0 N1Y,3C,11\n")
         midi = njam_to_midi(document)
