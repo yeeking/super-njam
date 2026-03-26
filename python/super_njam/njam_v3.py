@@ -19,12 +19,19 @@ All integer payloads are base36 for compactness.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Union
 
 from .base36 import from_base36, to_base36
 
 DEFAULT_PPQ = 96
+DEFAULT_NOTE_VELOCITY = 96
+DEFAULT_NOTE_DURATION = 24
+
+
+def _clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
 
 
 @dataclass(frozen=True)
@@ -131,7 +138,70 @@ def _parse_header(line: str) -> Dict[str, str]:
     return metadata
 
 
-def _parse_event_tokens(tokens: Sequence[str]) -> List[NJamEvent]:
+def _split_document_lines(text: str) -> List[str]:
+    stripped = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(stripped) >= 2:
+        return stripped
+    assert stripped, "NJamV3 document must not be empty."
+    line = stripped[0]
+    assert line.startswith("NV3|"), "NJamV3 document must start with 'NV3|' header."
+    body_match = re.search(r"\sT[-0-9A-Z]+", line)
+    assert body_match is not None, "NJamV3 document must contain a header line and body line."
+    split_at = body_match.start()
+    header_line = line[:split_at].strip()
+    body_line = line[split_at:].strip()
+    assert body_line, "Recovered NJamV3 body is empty."
+    return [header_line, body_line]
+
+
+def _extract_base36_fields(payload: str) -> List[str]:
+    return re.findall(r"-?[0-9A-Z]+", payload.upper())
+
+
+def _parse_note_payload(payload: str, default_velocity: int, default_duration: int) -> tuple[int, int, int]:
+    parts = [part.strip().upper() for part in payload.split(",")]
+    if len(parts) >= 3:
+        pitch_s = parts[0]
+        velocity_s = parts[1] or to_base36(default_velocity)
+        duration_s = parts[2] or to_base36(default_duration)
+        return (
+            _clamp(from_base36(pitch_s), 0, 127),
+            _clamp(from_base36(velocity_s), 1, 127),
+            max(1, from_base36(duration_s)),
+        )
+    fields = _extract_base36_fields(payload)
+    assert fields, f"Malformed NJam note payload: {payload!r}"
+    pitch = _clamp(from_base36(fields[0]), 0, 127)
+    velocity = _clamp(from_base36(fields[1]), 1, 127) if len(fields) >= 2 else default_velocity
+    duration = max(1, from_base36(fields[2])) if len(fields) >= 3 else default_duration
+    return pitch, velocity, duration
+
+
+def _parse_cc_payload(payload: str, default_value: int = 0) -> tuple[int, int]:
+    parts = [part.strip().upper() for part in payload.split(",")]
+    if len(parts) >= 2:
+        control_s = parts[0]
+        value_s = parts[1] or to_base36(default_value)
+        return _clamp(from_base36(control_s), 0, 127), _clamp(from_base36(value_s), 0, 127)
+    fields = _extract_base36_fields(payload)
+    assert fields, f"Malformed NJam control payload: {payload!r}"
+    control = _clamp(from_base36(fields[0]), 0, 127)
+    value = _clamp(from_base36(fields[1]), 0, 127) if len(fields) >= 2 else default_value
+    return control, value
+
+
+def _parse_pitch_bend_payload(payload: str, default_value: int = 0) -> int:
+    fields = _extract_base36_fields(payload)
+    if not fields:
+        return default_value
+    return _clamp(from_base36(fields[0]), -8192, 8191)
+
+
+def _parse_event_tokens(
+    tokens: Sequence[str],
+    default_note_velocity: int = DEFAULT_NOTE_VELOCITY,
+    default_note_duration: int = DEFAULT_NOTE_DURATION,
+) -> List[NJamEvent]:
     events: List[NJamEvent] = []
     current_time = 0
     pending_time = False
@@ -145,24 +215,24 @@ def _parse_event_tokens(tokens: Sequence[str]) -> List[NJamEvent]:
             continue
         assert pending_time, f"Expected time token before event token {token!r}"
         if kind == "N":
-            pitch_s, velocity_s, duration_s = payload.split(",")
+            pitch, velocity, duration = _parse_note_payload(payload, default_note_velocity, default_note_duration)
             events.append(
                 NoteEvent(
                     time=current_time,
-                    pitch=from_base36(pitch_s),
-                    velocity=from_base36(velocity_s),
-                    duration=from_base36(duration_s),
+                    pitch=pitch,
+                    velocity=velocity,
+                    duration=duration,
                 )
             )
         elif kind == "B":
-            events.append(PitchBendEvent(time=current_time, value=from_base36(payload)))
+            events.append(PitchBendEvent(time=current_time, value=_parse_pitch_bend_payload(payload)))
         elif kind == "C":
-            control_s, value_s = payload.split(",")
+            control, value = _parse_cc_payload(payload)
             events.append(
                 ControlChangeEvent(
                     time=current_time,
-                    control=from_base36(control_s),
-                    value=from_base36(value_s),
+                    control=control,
+                    value=value,
                 )
             )
         else:
@@ -172,13 +242,13 @@ def _parse_event_tokens(tokens: Sequence[str]) -> List[NJamEvent]:
 
 
 def parse_document(text: str) -> NJamDocument:
-    stripped = [line.strip() for line in text.splitlines() if line.strip()]
-    assert len(stripped) >= 2, "NJamV3 document must contain a header line and body line."
+    stripped = _split_document_lines(text)
     header = _parse_header(stripped[0])
     tokens: List[str] = []
     for line in stripped[1:]:
         tokens.extend(line.split())
-    events = _parse_event_tokens(tokens)
+    default_note_duration = max(1, int(header.get("ppq", DEFAULT_PPQ)) // 4)
+    events = _parse_event_tokens(tokens, default_note_velocity=DEFAULT_NOTE_VELOCITY, default_note_duration=default_note_duration)
     assert events, "NJamV3 body must contain at least one event."
     return NJamDocument(metadata=header, events=events)
 
@@ -189,4 +259,3 @@ def prompt_prefix(document: NJamDocument, ratio: float) -> str:
     prefix_count = max(1, int(len(events) * ratio))
     prefix_doc = NJamDocument(metadata=dict(document.metadata), events=events[:prefix_count])
     return encode_document(prefix_doc)
-

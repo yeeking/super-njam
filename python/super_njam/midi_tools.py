@@ -3,11 +3,50 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import mido
 
 from .njam_v3 import ControlChangeEvent, NJamDocument, NoteEvent, PitchBendEvent, parse_document
+
+INSTRUMENT_PROGRAMS: Dict[str, int] = {
+    "piano": 0,
+    "acoustic_piano": 0,
+    "guitar": 24,
+    "bass": 33,
+    "violin": 40,
+    "cello": 42,
+    "trumpet": 56,
+    "trombone": 57,
+    "saxophone": 65,
+    "alto_sax": 65,
+    "tenor_sax": 66,
+    "flute": 73,
+    "clarinet": 71,
+    "as": 65,
+    "ts": 66,
+    "tp": 56,
+    "tb": 57,
+    "cl": 71,
+    "pno": 0,
+    "gtr": 24,
+    "bs": 33,
+}
+
+
+def resolve_midi_program(metadata: Dict[str, str]) -> Optional[int]:
+    if "instrument_program" in metadata:
+        try:
+            value = int(metadata["instrument_program"])
+            if 0 <= value <= 127:
+                return value
+        except ValueError:
+            pass
+    instrument = str(metadata.get("render_instrument", metadata.get("instrument", ""))).strip().lower()
+    if not instrument:
+        return None
+    instrument = instrument.replace(" ", "_")
+    return INSTRUMENT_PROGRAMS.get(instrument)
 
 
 def njam_to_midi(document: NJamDocument) -> mido.MidiFile:
@@ -30,6 +69,9 @@ def njam_to_midi(document: NJamDocument) -> mido.MidiFile:
                 time=0,
             )
         )
+    program = resolve_midi_program(document.metadata)
+    if program is not None:
+        note_track.append(mido.Message("program_change", program=program, time=0))
 
     absolute_messages: List[Tuple[int, mido.Message]] = []
     for event in document.sorted_events():
@@ -106,4 +148,3 @@ def midi_to_njam(path: Path) -> NJamDocument:
 def njam_file_to_midi(input_path: Path, output_path: Path) -> None:
     document = parse_document(input_path.read_text())
     write_midi(document, output_path)
-

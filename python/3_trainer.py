@@ -87,7 +87,14 @@ def main() -> None:
     parser.add_argument(
         "--soundfont",
         type=Path,
-        help="Optional soundfont file used to render MIDI previews to audio. Expected: a readable .sf2 or compatible soundfont path.",
+        default=Path("soundfonts/SGM-v2.01-YamahaGrand-Guit-Bass-v2.7.sf2"),
+        help="Soundfont file used to render MIDI previews to audio. Expected: a readable .sf2 path. Defaults to the higher-quality local training soundfont.",
+    )
+    parser.add_argument(
+        "--instrument",
+        type=str,
+        default="saxophone",
+        help="Instrument patch used for rendered training samples. Expected values: names such as saxophone, alto_sax, tenor_sax, piano, trumpet, or clarinet. Default: saxophone.",
     )
     args = parser.parse_args()
     config = TrainConfig(
@@ -104,6 +111,7 @@ def main() -> None:
         sample_prompt_ratio=args.sample_prompt_ratio,
         sample_limit=args.sample_limit,
         soundfont_path=args.soundfont,
+        render_instrument=args.instrument,
     )
     summary = run_training(config)
     print(json.dumps(summary, indent=2, default=str))

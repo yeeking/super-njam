@@ -11,7 +11,7 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus.jsonl --limit 32
 .venv/bin/python python/2_tokenizer.py --corpus artifacts/corpus.jsonl --out artifacts/tokenizers.json
-.venv/bin/python python/3_trainer.py --corpus artifacts/corpus.jsonl --output-dir artifacts/train_smoke --max-epochs 1 --seq-len 128
+.venv/bin/python python/3_trainer.py --corpus artifacts/corpus.jsonl --output-dir artifacts/train_smoke --max-epochs 2 --seq-len 128
 .venv/bin/python python/5_trainer_hyper.py --corpus artifacts/corpus.jsonl --output-dir artifacts/sweep --summary-out artifacts/sweep_summary.json --max-epochs 1 --seq-len 128
 .venv/bin/python python/5_exporter.py --model-dir artifacts/train_smoke/hf_model --output-dir artifacts/gguf --outfile model-f32.gguf --outtype f32
 .venv/bin/python python/6_exporter.py --model artifacts/gguf/model-f32.gguf --prompt-file sample_prompt.njam
