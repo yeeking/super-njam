@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, asdict
+import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -318,6 +319,7 @@ class TrainConfig:
     sample_prompt_ratio: float = 0.35
     sample_limit: int = 2
     sample_every_n_epochs: int = 1
+    sample_every_n_items: Optional[int] = None
     dataset_prep_workers: Optional[int] = None
     soundfont_path: Optional[Path] = DEFAULT_TRAINING_SOUNDFONT
     render_instrument: str = "saxophone"
@@ -336,20 +338,21 @@ class NJamLightningModule(L.LightningModule):
         self.tokenizer = tokenizer
         self.val_samples = list(val_samples)
         self.cfg = config
+        self._items_seen_for_sample_render = 0
+        self._next_sample_render_item_target = (
+            None if config.sample_every_n_items is None else int(config.sample_every_n_items)
+        )
+        self._reference_written_sample_indices: set[int] = set()
         self.save_hyperparameters(ignore=["model", "tokenizer", "val_samples"])
 
-    def _sample_output_paths(self, epoch: int, sample_idx: int) -> Tuple[Path, Path, Path]:
-        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
-        prefix = self.cfg.output_dir / f"sample_{epoch}_{sample_idx}"
-        return (
-            prefix.with_suffix(".njam"),
-            prefix.with_suffix(".mid"),
-            prefix.with_suffix(".wav"),
-        )
+    def _sample_prefix(self, epoch: int, sample_idx: int) -> str:
+        if self.cfg.sample_every_n_items is None:
+            return f"sample_{epoch}_{sample_idx}"
+        return f"sample_{epoch}_{int(self.global_step)}_{sample_idx}"
 
     def _artifact_path(self, epoch: int, sample_idx: int, label: str, suffix: str) -> Path:
         self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
-        return self.cfg.output_dir / f"sample_{epoch}_{sample_idx}.{label}.{suffix}"
+        return self.cfg.output_dir / f"{self._sample_prefix(epoch, sample_idx)}.{label}.{suffix}"
 
     def _build_prompt(self, text: str) -> str:
         tokens = text.split()
@@ -533,7 +536,7 @@ class NJamLightningModule(L.LightningModule):
             self._log_sample_audio(Path(model_only_paths["wav"]), sample_idx)
 
     def _write_reference_once(self, sample_idx: int, text: str, summary: Dict[str, object]) -> None:
-        if self.current_epoch != 0:
+        if sample_idx in self._reference_written_sample_indices:
             summary["reference_paths"] = "written_at_epoch_0_only"
             return
         try:
@@ -545,6 +548,7 @@ class NJamLightningModule(L.LightningModule):
                 "reference",
                 text,
             )
+            self._reference_written_sample_indices.add(sample_idx)
         except Exception as exc:
             summary["reference_error"] = str(exc)
 
@@ -560,6 +564,7 @@ class NJamLightningModule(L.LightningModule):
         generated_text = header_text + "\n" + full_body_text.strip() + "\n"
         summary: Dict[str, object] = {
             "epoch": int(self.current_epoch),
+            "global_step": int(self.global_step),
             "sample_idx": int(sample_idx),
             "prompt": effective_prompt,
             "generated_text_preview": full_body_text[:500],
@@ -608,6 +613,21 @@ class NJamLightningModule(L.LightningModule):
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
+    def on_train_batch_end(self, outputs, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
+        if self.cfg.sample_every_n_items is None:
+            return
+        if not self.val_samples or self.cfg.sample_limit <= 0:
+            return
+        assert self.cfg.sample_every_n_items > 0, "sample_every_n_items must be positive."
+        batch_items = int(batch["input_ids"].shape[0])
+        self._items_seen_for_sample_render += batch_items
+        assert self._next_sample_render_item_target is not None
+        if self._items_seen_for_sample_render < self._next_sample_render_item_target:
+            return
+        for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
+            self._render_validation_sample(idx, sample)
+        self._next_sample_render_item_target += int(self.cfg.sample_every_n_items)
+
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
         loss = outputs.loss
@@ -618,6 +638,8 @@ class NJamLightningModule(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         if not self.val_samples:
+            return
+        if self.cfg.sample_every_n_items is not None:
             return
         assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
         if self.current_epoch % self.cfg.sample_every_n_epochs != 0:
@@ -751,6 +773,10 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         "header_tokens_dropped": True,
         "left_padding": True,
         "pad_loss_masked": True,
+        "sample_every_n_items": config.sample_every_n_items,
+        "sample_step_interval_estimate": (
+            None if config.sample_every_n_items is None else math.ceil(config.sample_every_n_items / config.batch_size)
+        ),
         "dataset_prep_workers": config.dataset_prep_workers,
         "tokenizer_dir": str(config.output_dir / "tokenizer"),
         "config": asdict(config),

@@ -23,7 +23,9 @@
 - Added structured sweep scaffolding for small architecture comparisons.
 - Replaced the old packed global training dataset with per-solo sliding windows so training windows never cross solo boundaries.
 - Sliding-window training now uses left-padding at solo starts, keeps tail positions, masks pad loss, and trains on NJam body/event tokens rather than headers.
-- Added progress reporting for dataset preparation and switched the prep path to prefer a process pool, with safe fallback if the runtime blocks worker processes.
+- Added progress reporting for dataset preparation.
+- Refactored the sliding-window dataset so it stores lightweight token-id data and window references, with tensors created lazily in `__getitem__`.
+- Switched dataset preparation back to serial by default after the parallel eager-tensor path proved slower in practice; explicit worker override is still available.
 - Added validation prompt truncation to respect model context limits before sample generation.
 - Tightened training sample rendering so malformed continuations can still be recovered, clamped, and rendered where possible instead of being discarded.
 - Added continuation recovery metrics so summaries can report how many events were recoverable and how much default filling was needed.
@@ -35,10 +37,13 @@
 - Validated a working end-to-end C++ inference path with a larger 4-layer, 128-hidden, 256-context model exported as `f32` GGUF.
 - Tightened the C++ CLI to default to CPU-safe inference settings on this machine and documented the stable `f32` export path in `README.md`.
 - Re-verified the GGUF export path after the sliding-window dataset changes with a fresh smoke-trained checkpoint.
+- Added a checkpoint-based GGUF exporter that reconstructs the HF model from the Lightning run folder plus `.ckpt`, so a prebuilt `hf_model` directory is no longer required.
+- Tightened exporter preflight checks so it now fails early with a clear message if `libs/llama.cpp` has not been cloned locally.
 
 ## Current Status
 
 - The Python pipeline is in a usable state for real training runs: corpus export, tokenizer build, sliding-window training, sample rendering, GGUF export, and C++ inference have all been smoke tested.
+- A small 2-epoch smoke run from a tiny corpus was completed and exported successfully to GGUF using the new checkpoint-only exporter path.
 - Early or very small models still often produce malformed NJam, which is expected, but the parser, recovery metrics, and recovery render path now make those outputs inspectable and sometimes audible.
 
 ## Next Steps

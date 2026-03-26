@@ -111,6 +111,11 @@ def main() -> None:
         help="How often to generate validation examples. Expected range: integers >= 1, where 1 means every epoch and 5 means every 5 epochs.",
     )
     parser.add_argument(
+        "--sample-every-n-items",
+        type=int,
+        help="Optional item-based render interval for generated samples. Expected range: positive integer counts of training items. If set, sample rendering is triggered from training progress rather than epoch boundaries.",
+    )
+    parser.add_argument(
         "--dataset-prep-workers",
         type=int,
         help="Worker count for sliding-window dataset preparation after tokenizer training. Expected range: 1-32 on most machines. If omitted, the trainer chooses a default automatically.",
@@ -143,6 +148,7 @@ def main() -> None:
         sample_prompt_ratio=args.sample_prompt_ratio,
         sample_limit=args.sample_limit,
         sample_every_n_epochs=args.sample_every_n_epochs,
+        sample_every_n_items=args.sample_every_n_items,
         dataset_prep_workers=args.dataset_prep_workers,
         soundfont_path=args.soundfont,
         render_instrument=args.instrument,

@@ -13,7 +13,7 @@ python3 -m venv .venv
 Stage 1: corpus export and NJam/MIDI conversion:
 
 ```bash
-.venv/bin   
+.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus.jsonl --limit 32
 .venv/bin/python python/7_midi_and_njam.py midi-demo --in "data/midi/ArtPepper_Anthropology_FINAL.mid" --out-dir outputs --render-audio --soundfont soundfonts/soundfont.sf2
 ```
 
@@ -37,15 +37,22 @@ Training notes:
 - If `--output-dir` is omitted, the trainer creates a run folder under `artifacts/` from model settings and a timestamp.
 - Training now uses per-solo sliding windows only. Windows never cross solo boundaries.
 - Dataset windows train on NJam body/event tokens. Header metadata is still used for held-out rendering and recovery.
+- Dataset preparation is serial by default again, and the sliding-window dataset now stores lightweight token/range data with tensors created lazily in `__getitem__`.
+- Use `--dataset-prep-workers` only if you explicitly want parallel dataset preparation.
 - Use `--sample-every-n-epochs` to reduce validation sample generation frequency.
 - Validation renders default to `saxophone`.
 
 Stage 4: GGUF export and C++ inference:
 
 ```bash
-.venv/bin/python python/5_exporter.py --model-dir artifacts/train_smoke/hf_model --output-dir artifacts/gguf --outfile model-f32.gguf --outtype f32
-.venv/bin/python python/6_exporter.py --model artifacts/gguf/model-f32.gguf --prompt-file sample_prompt.njam
+.venv/bin/python python/5_exporter.py --ckpt artifacts/train_smoke/checkpoints/best.ckpt --output-dir artifacts/gguf --outfile model-f16.gguf --outtype f16
+.venv/bin/python python/6_exporter.py --model artifacts/gguf/model-f16.gguf --prompt-file sample_prompt.njam
 ```
+
+Export notes:
+
+- `python/5_exporter.py` now infers the run folder from the checkpoint path and rebuilds the HF model automatically before GGUF conversion.
+- The exporter expects `llama.cpp` to be cloned under `libs/llama.cpp` and will fail early with a suggestion to check `libs/README.md` if it is missing.
 
 C++ smoke build:
 
@@ -57,7 +64,7 @@ cmake --build cplusplus/llamacpp-minimal-example/build
 C++ inference:
 
 ```bash
-./cplusplus/llamacpp-minimal-example/build/super-njam-cli -m artifacts/gguf/model-f32.gguf -p sample_prompt.njam -n 64 -o sample_output.njam
+./cplusplus/llamacpp-minimal-example/build/super-njam-cli -m artifacts/gguf/model-f16.gguf -p sample_prompt.njam -n 64 -o sample_output.njam
 ```
 
 Training output notes:

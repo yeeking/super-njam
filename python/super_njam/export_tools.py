@@ -46,6 +46,23 @@ def _run(command: List[str], cwd: Optional[Path] = None) -> subprocess.Completed
     return result
 
 
+def assert_llama_cpp_checkout(llama_cpp_dir: Path) -> None:
+    convert_script = llama_cpp_dir / "convert_hf_to_gguf.py"
+    if convert_script.exists():
+        return
+    libs_readme = Path("libs/README.md")
+    suggestion = (
+        "llama.cpp checkout not found. Expected to find "
+        f"{convert_script}. Clone llama.cpp into libs/ first."
+    )
+    if libs_readme.exists():
+        suggestion += (
+            f" See {libs_readme} for the local clone instruction, "
+            "for example: git clone git@github.com:ggml-org/llama.cpp.git libs/llama.cpp"
+        )
+    raise AssertionError(suggestion)
+
+
 def export_checkpoint_to_hf_model(run_dir: Path, checkpoint_path: Path, output_dir: Path) -> Path:
     assert run_dir.exists(), f"Run directory does not exist: {run_dir}"
     assert checkpoint_path.exists(), f"Checkpoint does not exist: {checkpoint_path}"
@@ -82,8 +99,8 @@ def export_checkpoint_to_hf_model(run_dir: Path, checkpoint_path: Path, output_d
 
 def export_hf_to_gguf(config: ExportConfig) -> Path:
     assert config.model_dir.exists(), f"Model directory does not exist: {config.model_dir}"
+    assert_llama_cpp_checkout(config.llama_cpp_dir)
     convert_script = config.llama_cpp_dir / "convert_hf_to_gguf.py"
-    assert convert_script.exists(), f"llama.cpp convert script not found: {convert_script}"
     config.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = config.output_dir / config.outfile
     _run(
