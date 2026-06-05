@@ -1,6 +1,6 @@
 # Project Log
 
-## Stage 1
+## Stage 1: converting to and from NJAM V3 format 
 
 - Implemented NJamV3 as a compact beat-relative text format with note, CC, and pitch-bend events.
 - Added modular Weimar DB extraction, Weimar to NJamV3 conversion, NJamV3 to MIDI conversion, and MIDI back to NJamV3 conversion.
@@ -8,12 +8,12 @@
 - Added parser recovery for malformed early-model NJam output so partial generated text can still be converted into musical events where possible.
 - Added test coverage for strict round trips, malformed NJam recovery, and recovered MIDI event generation.
 
-## Stage 2
+## Stage 2: tokenizers
 
 - Added tokenizer comparison tooling for multiple strategies and a SentencePiece-based training/export path.
 - Fixed the training tokenizer path so training now uses a working SentencePiece tokenizer instead of collapsing to empty encodings.
 
-## Stage 3
+## Stage 3: training scripts 
 
 - Added a portable Lightning training pipeline around `LlamaForCausalLM`, solo-level train/val/test splitting, TensorBoard logging, and sample generation.
 - Added validation-time NJam, MIDI, and audio rendering during training with saved sample artifacts per epoch.
@@ -31,7 +31,7 @@
 - Added continuation recovery metrics so summaries can report how many events were recoverable and how much default filling was needed.
 - Trainer run folders can now be auto-named from model settings and a timestamp when `--output-dir` is omitted.
 
-## Stage 4
+## Stage 4: exporting trained models to GGUF format 
 
 - Added GGUF export, quantization, and llama.cpp benchmark helper scripts.
 - Validated a working end-to-end C++ inference path with a larger 4-layer, 128-hidden, 256-context model exported as `f32` GGUF.

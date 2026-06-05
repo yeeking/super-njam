@@ -132,6 +132,18 @@ def main() -> None:
         default="saxophone",
         help="Instrument patch used for rendered training samples. Expected values: names such as saxophone, alto_sax, tenor_sax, piano, trumpet, or clarinet. Default: saxophone.",
     )
+    parser.add_argument(
+        "--validation-preflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run one real training batch and immediate validation before the full training run. Enabled by default; pass --no-validation-preflight to skip it for known-good configs.",
+    )
+    parser.add_argument(
+        "--validation-preflight-val-batches",
+        type=int,
+        default=1,
+        help="Number of validation batches to run during --validation-preflight. Expected range: integers >= 1; 1 is usually enough to check batch memory.",
+    )
     args = parser.parse_args()
     output_dir = args.output_dir if args.output_dir is not None else _default_output_dir(args)
     config = TrainConfig(
@@ -152,6 +164,8 @@ def main() -> None:
         dataset_prep_workers=args.dataset_prep_workers,
         soundfont_path=args.soundfont,
         render_instrument=args.instrument,
+        validation_preflight=args.validation_preflight,
+        validation_preflight_val_batches=args.validation_preflight_val_batches,
     )
     summary = run_training(config)
     summary["resolved_output_dir"] = str(output_dir)

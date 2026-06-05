@@ -323,6 +323,8 @@ class TrainConfig:
     dataset_prep_workers: Optional[int] = None
     soundfont_path: Optional[Path] = DEFAULT_TRAINING_SOUNDFONT
     render_instrument: str = "saxophone"
+    validation_preflight: bool = False
+    validation_preflight_val_batches: int = 1
 
 
 class NJamLightningModule(L.LightningModule):
@@ -742,19 +744,41 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         mode="min",
         save_on_train_epoch_end=False,
     )
+    def make_train_loader() -> DataLoader:
+        return DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, **dataloader_kwargs())
+
+    def make_val_loader() -> DataLoader:
+        return DataLoader(val_ds, batch_size=config.batch_size, **dataloader_kwargs())
+
+    accelerator_kwargs = detect_accelerator()
+    if config.validation_preflight:
+        assert config.validation_preflight_val_batches >= 1, "validation_preflight_val_batches must be at least 1."
+        preflight_trainer = L.Trainer(
+            max_epochs=1,
+            limit_train_batches=1,
+            limit_val_batches=config.validation_preflight_val_batches,
+            num_sanity_val_steps=0,
+            logger=logger,
+            callbacks=[],
+            enable_checkpointing=False,
+            log_every_n_steps=1,
+            **accelerator_kwargs,
+        )
+        preflight_trainer.fit(module, make_train_loader(), make_val_loader())
+
+    trainer_kwargs = {"max_epochs": config.max_epochs}
+    if config.validation_preflight:
+        trainer_kwargs["num_sanity_val_steps"] = 0
+
     trainer = L.Trainer(
-        max_epochs=config.max_epochs,
         logger=logger,
         callbacks=[checkpoint],
         enable_checkpointing=True,
         log_every_n_steps=1,
-        **detect_accelerator(),
+        **trainer_kwargs,
+        **accelerator_kwargs,
     )
-    trainer.fit(
-        module,
-        DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, **dataloader_kwargs()),
-        DataLoader(val_ds, batch_size=config.batch_size, **dataloader_kwargs()),
-    )
+    trainer.fit(module, make_train_loader(), make_val_loader())
     hf_dir = config.output_dir / "hf_model"
     hf_dir.mkdir(parents=True, exist_ok=True)
     module.model.save_pretrained(str(hf_dir))
@@ -774,6 +798,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         "left_padding": True,
         "pad_loss_masked": True,
         "sample_every_n_items": config.sample_every_n_items,
+        "validation_preflight": config.validation_preflight,
+        "validation_preflight_val_batches": config.validation_preflight_val_batches,
         "sample_step_interval_estimate": (
             None if config.sample_every_n_items is None else math.ceil(config.sample_every_n_items / config.batch_size)
         ),

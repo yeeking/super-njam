@@ -7,7 +7,7 @@ Setup:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip setuptools wheel
-.venv/bin/pip install numpy mido pretty_midi tokenizers transformers sentencepiece torch lightning tensorboard pyfluidsynth tqdm
+.venv/bin/pip install numpy mido pretty_midi tokenizers transformers sentencepiece torch lightning tensorboard pyfluidsynth tqdm tensorboard tensorboardx
 ```
 
 Stage 1: corpus export and NJam/MIDI conversion:
