@@ -240,11 +240,53 @@ def weimar_to_njam(solo: WeimarSolo, ppq: int = DEFAULT_PPQ) -> NJamDocument:
     return NJamDocument(metadata=metadata, events=events)
 
 
+ALL_KEY_TRANSPOSITIONS = tuple(range(-5, 0)) + tuple(range(1, 7))
+
+
+def transpose_document(document: NJamDocument, semitones: int) -> NJamDocument:
+    events = []
+    for event in document.events:
+        if isinstance(event, NoteEvent):
+            pitch = event.pitch + semitones
+            if not 0 <= pitch <= 127:
+                raise ValueError(
+                    f"Cannot transpose pitch {event.pitch} by {semitones:+d} semitones; result {pitch} is outside MIDI range."
+                )
+            events.append(
+                NoteEvent(
+                    time=event.time,
+                    pitch=pitch,
+                    velocity=event.velocity,
+                    duration=event.duration,
+                )
+            )
+        else:
+            events.append(event)
+    metadata = dict(document.metadata)
+    metadata["original_key"] = str(document.metadata.get("original_key", document.metadata.get("key", "")))
+    metadata["transpose_semitones"] = f"{semitones:+d}"
+    return NJamDocument(metadata=metadata, events=events)
+
+
+def _corpus_record(solo: WeimarSolo, document: NJamDocument, transpose_semitones: int = 0) -> Dict[str, object]:
+    return {
+        "melid": solo.metadata.melid,
+        "performer": solo.metadata.performer,
+        "title": solo.metadata.title,
+        "instrument": solo.metadata.instrument,
+        "tempo": solo.metadata.avgtempo,
+        "signature": solo.metadata.signature,
+        "transpose_semitones": transpose_semitones,
+        "text": encode_document(document),
+    }
+
+
 def export_corpus_jsonl(
     db_path: Path,
     output_path: Path,
     limit: Optional[int] = None,
     ppq: int = DEFAULT_PPQ,
+    permute_to_all_keys: bool = False,
 ) -> int:
     melids = list_melids(db_path, limit=limit)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,19 +295,13 @@ def export_corpus_jsonl(
         for melid in melids:
             solo = load_solo(db_path, melid)
             document = weimar_to_njam(solo, ppq=ppq)
-            handle.write(
-                json.dumps(
-                    {
-                        "melid": melid,
-                        "performer": solo.metadata.performer,
-                        "title": solo.metadata.title,
-                        "instrument": solo.metadata.instrument,
-                        "tempo": solo.metadata.avgtempo,
-                        "signature": solo.metadata.signature,
-                        "text": encode_document(document),
-                    }
+            documents = [(0, document)]
+            if permute_to_all_keys:
+                documents.extend(
+                    (semitones, transpose_document(document, semitones))
+                    for semitones in ALL_KEY_TRANSPOSITIONS
                 )
-                + "\n"
-            )
-            count += 1
+            for transpose_semitones, output_document in documents:
+                handle.write(json.dumps(_corpus_record(solo, output_document, transpose_semitones)) + "\n")
+                count += 1
     return count

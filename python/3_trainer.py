@@ -144,6 +144,12 @@ def main() -> None:
         default=1,
         help="Number of validation batches to run during --validation-preflight. Expected range: integers >= 1; 1 is usually enough to check batch memory.",
     )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=3,
+        help="Validation checks without a new best val_loss before stopping training. Expected range: integers >= 0; default 3.",
+    )
     args = parser.parse_args()
     output_dir = args.output_dir if args.output_dir is not None else _default_output_dir(args)
     config = TrainConfig(
@@ -166,6 +172,7 @@ def main() -> None:
         render_instrument=args.instrument,
         validation_preflight=args.validation_preflight,
         validation_preflight_val_batches=args.validation_preflight_val_batches,
+        early_stopping_patience=args.early_stopping_patience,
     )
     summary = run_training(config)
     summary["resolved_output_dir"] = str(output_dir)

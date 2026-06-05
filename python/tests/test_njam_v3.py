@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
@@ -17,7 +18,7 @@ from super_njam.njam_v3 import (
     parse_document,
     recover_continuation_document,
 )
-from super_njam.weimar_db import export_corpus_jsonl, load_solo, weimar_to_njam
+from super_njam.weimar_db import ALL_KEY_TRANSPOSITIONS, export_corpus_jsonl, load_solo, transpose_document, weimar_to_njam
 
 
 def _event_key(event):
@@ -275,6 +276,38 @@ class WeimarRoundTripTests(unittest.TestCase):
             count = export_corpus_jsonl(Path("data/wjazzd.db"), output_path, limit=2)
             self.assertEqual(count, 2)
             self.assertTrue(output_path.read_text().strip())
+
+    def test_transpose_document_shifts_note_pitches_only(self) -> None:
+        document = NJamDocument(
+            metadata={"ppq": "96", "key": "C"},
+            events=[
+                PitchBendEvent(time=0, value=128),
+                ControlChangeEvent(time=0, control=1, value=64),
+                NoteEvent(time=0, pitch=60, velocity=90, duration=24),
+                NoteEvent(time=24, pitch=64, velocity=80, duration=12),
+            ],
+        )
+        transposed = transpose_document(document, 5)
+        self.assertEqual([event.pitch for event in transposed.events if isinstance(event, NoteEvent)], [65, 69])
+        self.assertEqual([_event_key(event) for event in transposed.events if not isinstance(event, NoteEvent)], [
+            ("bend", 0, 128),
+            ("cc", 0, 1, 64),
+        ])
+        self.assertEqual(transposed.metadata["original_key"], "C")
+        self.assertEqual(transposed.metadata["transpose_semitones"], "+5")
+
+    def test_export_corpus_jsonl_can_permute_to_all_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "corpus.jsonl"
+            count = export_corpus_jsonl(Path("data/wjazzd.db"), output_path, limit=1, permute_to_all_keys=True)
+            rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+            self.assertEqual(count, 12)
+            self.assertEqual(len(rows), 12)
+            self.assertEqual(
+                sorted(row["transpose_semitones"] for row in rows),
+                sorted((0, *ALL_KEY_TRANSPOSITIONS)),
+            )
+            self.assertEqual({row["melid"] for row in rows}, {rows[0]["melid"]})
 
     def test_weimar_generated_midi_roundtrip_is_lossless_for_supported_events(self) -> None:
         for melid in (1, 5, 10):

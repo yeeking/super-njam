@@ -14,6 +14,7 @@ Stage 1: corpus export and NJam/MIDI conversion:
 
 ```bash
 .venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus.jsonl --limit 32
+.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus_all_keys.jsonl --limit 32 --permute-to-all-keys
 .venv/bin/python python/7_midi_and_njam.py midi-demo --in "data/midi/ArtPepper_Anthropology_FINAL.mid" --out-dir outputs --render-audio --soundfont soundfonts/soundfont.sf2
 ```
 
@@ -34,6 +35,7 @@ Stage 3: training:
 
 Training notes:
 
+- Use `--permute-to-all-keys` during corpus export to include the original solo plus transposed copies at -5..-1 and +1..+6 semitones.
 - If `--output-dir` is omitted, the trainer creates a run folder under `artifacts/` from model settings and a timestamp.
 - Training now uses per-solo sliding windows only. Windows never cross solo boundaries.
 - Dataset windows train on NJam body/event tokens. Header metadata is still used for held-out rendering and recovery.

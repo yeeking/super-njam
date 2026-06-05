@@ -16,7 +16,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import lightning as L
 import sentencepiece as spm
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, Dataset
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -325,6 +325,7 @@ class TrainConfig:
     render_instrument: str = "saxophone"
     validation_preflight: bool = False
     validation_preflight_val_batches: int = 1
+    early_stopping_patience: int = 3
 
 
 class NJamLightningModule(L.LightningModule):
@@ -744,6 +745,12 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         mode="min",
         save_on_train_epoch_end=False,
     )
+    assert config.early_stopping_patience >= 0, "early_stopping_patience must be non-negative."
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        mode="min",
+        patience=config.early_stopping_patience,
+    )
     def make_train_loader() -> DataLoader:
         return DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, **dataloader_kwargs())
 
@@ -772,7 +779,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
 
     trainer = L.Trainer(
         logger=logger,
-        callbacks=[checkpoint],
+        callbacks=[checkpoint, early_stop],
         enable_checkpointing=True,
         log_every_n_steps=1,
         **trainer_kwargs,
@@ -800,6 +807,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         "sample_every_n_items": config.sample_every_n_items,
         "validation_preflight": config.validation_preflight,
         "validation_preflight_val_batches": config.validation_preflight_val_batches,
+        "early_stopping_monitor": "val_loss",
+        "early_stopping_patience": config.early_stopping_patience,
         "sample_step_interval_estimate": (
             None if config.sample_every_n_items is None else math.ceil(config.sample_every_n_items / config.batch_size)
         ),

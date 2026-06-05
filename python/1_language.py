@@ -65,6 +65,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=96,
         help="Pulses per quarter note used during corpus quantization. Expected range: 24-960; higher values preserve finer timing at the cost of longer sequences.",
     )
+    corpus.add_argument(
+        "--permute-to-all-keys",
+        "--permute_to_all_keys",
+        action="store_true",
+        help="Augment the corpus with transposed copies at -5..-1 and +1..+6 semitones, keeping each original solo and its transpositions in the same split.",
+    )
 
     to_midi = sub.add_parser("njam-to-midi", help="Convert NJamV3 text file to MIDI.")
     to_midi.add_argument(
@@ -128,7 +134,13 @@ def main() -> None:
             print(text, end="")
         return
     if args.command == "export-corpus":
-        count = export_corpus_jsonl(args.db, args.out, limit=args.limit, ppq=args.ppq)
+        count = export_corpus_jsonl(
+            args.db,
+            args.out,
+            limit=args.limit,
+            ppq=args.ppq,
+            permute_to_all_keys=args.permute_to_all_keys,
+        )
         print(json.dumps({"output": str(args.out), "count": count}, indent=2))
         return
     if args.command == "njam-to-midi":
