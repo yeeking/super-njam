@@ -5,6 +5,8 @@ PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 CORPUS="${CORPUS:-artifacts/corpus.jsonl}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/model_grid}"
 PREFLIGHT_OUTPUT_ROOT="${PREFLIGHT_OUTPUT_ROOT:-${OUTPUT_ROOT}_preflight}"
+# PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-all}"
+PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-larger_l16_h512_heads16_ff2048}"
 MAX_EPOCHS="${MAX_EPOCHS:-50}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 SEQ_LEN="${SEQ_LEN:-1024}"
@@ -33,17 +35,77 @@ declare -a RUNS=(
   "medium_l12_h384_heads8_ff1024 12 384 8 1024"
 )
 
+should_preflight_run() {
+  local run_name="$1"
+  local requested="${PREFLIGHT_RUNS//,/ }"
+  local selected
+
+  if [[ "$requested" == "all" ]]; then
+    return 0
+  fi
+  if [[ "$requested" == "none" ]]; then
+    return 1
+  fi
+
+  for selected in $requested; do
+    if [[ "$selected" == "$run_name" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_preflight_runs() {
+  local requested="${PREFLIGHT_RUNS//,/ }"
+  local selected run run_name _layers _hidden _heads _ff found
+
+  if [[ "$requested" == "all" || "$requested" == "none" ]]; then
+    return
+  fi
+
+  for selected in $requested; do
+    found=0
+    for run in "${RUNS[@]}"; do
+      read -r run_name _layers _hidden _heads _ff <<< "$run"
+      if [[ "$selected" == "$run_name" ]]; then
+        found=1
+        break
+      fi
+    done
+    if (( found == 0 )); then
+      echo "Unknown preflight run: $selected" >&2
+      echo "Known run names:" >&2
+      for run in "${RUNS[@]}"; do
+        read -r run_name _layers _hidden _heads _ff <<< "$run"
+        echo "  - $run_name" >&2
+      done
+      exit 1
+    fi
+  done
+}
+
+validate_preflight_runs
+
 echo "Corpus: $CORPUS"
 echo "Output root: $OUTPUT_ROOT"
 echo "Preflight output root: $PREFLIGHT_OUTPUT_ROOT"
+echo "Preflight runs: $PREFLIGHT_RUNS"
 echo "Shared settings: seq_len=$SEQ_LEN batch_size=$BATCH_SIZE lr=$LEARNING_RATE max_epochs=$MAX_EPOCHS early_stopping_patience=$EARLY_STOPPING_PATIENCE"
 echo
 
 declare -a FAILED_PREFLIGHTS=()
+declare -a SKIPPED_PREFLIGHTS=()
 
 for run in "${RUNS[@]}"; do
   read -r run_name layers hidden heads ff <<< "$run"
   output_dir="$PREFLIGHT_OUTPUT_ROOT/$run_name"
+
+  if ! should_preflight_run "$run_name"; then
+    echo "==> Skipping preflight $run_name"
+    SKIPPED_PREFLIGHTS+=("$run_name")
+    echo
+    continue
+  fi
 
   echo "==> Preflight $run_name"
   echo "    layers=$layers hidden=$hidden heads=$heads ff=$ff output=$output_dir"
@@ -80,7 +142,15 @@ if (( ${#FAILED_PREFLIGHTS[@]} > 0 )); then
   exit 1
 fi
 
-echo "All preflights passed. Starting full training runs."
+if (( ${#SKIPPED_PREFLIGHTS[@]} > 0 )); then
+  echo "Skipped preflight for ${#SKIPPED_PREFLIGHTS[@]} run(s):"
+  for run_name in "${SKIPPED_PREFLIGHTS[@]}"; do
+    echo "  - $run_name"
+  done
+  echo
+fi
+
+echo "All selected preflights passed. Starting full training runs."
 echo
 
 for run in "${RUNS[@]}"; do
