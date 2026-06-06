@@ -8,7 +8,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 CORPUS="${CORPUS:-artifacts/corpus-v4-all-keys.jsonl}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/model_grid}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/model_grid_v4_all_keys}"
 PREFLIGHT_OUTPUT_ROOT="${PREFLIGHT_OUTPUT_ROOT:-${OUTPUT_ROOT}_preflight}"
 # PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-all}"
 PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-larger_l16_h512_heads16_ff2048}"
@@ -118,6 +118,7 @@ for run in "${RUNS[@]}"; do
   if "$PYTHON_BIN" python/3_trainer.py \
     --corpus "$CORPUS" \
     --output-dir "$output_dir" \
+    --language njam-v4 \
     --max-epochs 0 \
     --seq-len "$SEQ_LEN" \
     --batch-size "$BATCH_SIZE" \
@@ -168,6 +169,7 @@ for run in "${RUNS[@]}"; do
   "$PYTHON_BIN" python/3_trainer.py \
     --corpus "$CORPUS" \
     --output-dir "$output_dir" \
+    --language njam-v4 \
     --max-epochs "$MAX_EPOCHS" \
     --seq-len "$SEQ_LEN" \
     --batch-size "$BATCH_SIZE" \
