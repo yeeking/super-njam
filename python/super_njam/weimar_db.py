@@ -285,23 +285,36 @@ def export_corpus_jsonl(
     db_path: Path,
     output_path: Path,
     limit: Optional[int] = None,
-    ppq: int = DEFAULT_PPQ,
+    ppq: Optional[int] = None,
     permute_to_all_keys: bool = False,
+    language: str = "njam-v3",
+    include_control_tokens: bool = False,
 ) -> int:
+    from .music_language import get_language
+
+    language_adapter = get_language(language)
+    resolved_ppq = ppq if ppq is not None else (960 if language_adapter.name == "njam-v2" else DEFAULT_PPQ)
     melids = list_melids(db_path, limit=limit)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with output_path.open("w", encoding="utf-8") as handle:
         for melid in melids:
             solo = load_solo(db_path, melid)
-            document = weimar_to_njam(solo, ppq=ppq)
+            document = language_adapter.weimar_to_document(solo, ppq=resolved_ppq)
             documents = [(0, document)]
             if permute_to_all_keys:
                 documents.extend(
-                    (semitones, transpose_document(document, semitones))
+                    (semitones, language_adapter.transpose_document(document, semitones))
                     for semitones in ALL_KEY_TRANSPOSITIONS
                 )
             for transpose_semitones, output_document in documents:
-                handle.write(json.dumps(_corpus_record(solo, output_document, transpose_semitones)) + "\n")
+                if include_control_tokens and language_adapter.name == "njam-v4":
+                    from . import njam_v4
+
+                    output_document = njam_v4.with_weimar_controls(output_document, solo)
+                record = _corpus_record(solo, output_document, transpose_semitones)
+                record["language"] = language_adapter.name
+                record["text"] = language_adapter.encode_document(output_document)
+                handle.write(json.dumps(record) + "\n")
                 count += 1
     return count

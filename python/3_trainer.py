@@ -37,7 +37,13 @@ def main() -> None:
         "--corpus",
         type=Path,
         required=True,
-        help="Input JSONL corpus of NJamV3 solos for training. Expected: an existing file exported by the language stage.",
+        help="Input JSONL corpus of NJam solos for training. Expected: an existing file exported by the language stage.",
+    )
+    parser.add_argument(
+        "--language",
+        choices=["njam-v3", "njam-v2", "njam-v4"],
+        default="njam-v3",
+        help="NJam language format used in the corpus. Default: njam-v3.",
     )
     parser.add_argument(
         "--output-dir",
@@ -187,6 +193,7 @@ def main() -> None:
         early_stopping_patience=args.early_stopping_patience,
         dataset_mode=args.dataset_mode,
         validation_dataset_mode=args.validation_dataset_mode,
+        language=args.language,
     )
     summary = run_training(config)
     summary["resolved_output_dir"] = str(output_dir)

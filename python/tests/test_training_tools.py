@@ -30,6 +30,11 @@ class SlidingWindowDatasetTests(unittest.TestCase):
         self.assertEqual(njam_header_text(text), "NV3|ppq=96|tempo=120|sig=4/4")
         self.assertEqual(njam_body_text(text), "T0 N1Y,3C,11 T1 C1,2O")
 
+    def test_v2_header_tokens_are_excluded_from_training_body(self) -> None:
+        text = "NV2|ppq=960|tempo=120.000|sig=4/4\n<song_start> p_60 c_0 v_96 d_480 w_0 <song_end>\n"
+        self.assertEqual(njam_header_text(text, language="njam-v2"), "NV2|ppq=960|tempo=120.000|sig=4/4")
+        self.assertEqual(njam_body_text(text, language="njam-v2"), "<song_start> p_60 c_0 v_96 d_480 w_0 <song_end>")
+
     def test_tiny_corpus_split_keeps_all_partitions_nonempty(self) -> None:
         records = [{"melid": idx, "text": "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11\n"} for idx in range(5)]
         splits = split_records_by_solo(records)

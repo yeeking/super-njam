@@ -60,7 +60,14 @@ class ControlChangeEvent:
     value: int
 
 
-NJamEvent = Union[NoteEvent, PitchBendEvent, ControlChangeEvent]
+@dataclass(frozen=True)
+class ProgramChangeEvent:
+    time: int
+    program: int
+    channel: int = 0
+
+
+NJamEvent = Union[NoteEvent, PitchBendEvent, ControlChangeEvent, ProgramChangeEvent]
 
 
 @dataclass(frozen=True)
@@ -113,6 +120,8 @@ class NJamDocument:
                 rank = 2
             elif isinstance(event, ControlChangeEvent):
                 rank = 1
+            elif isinstance(event, ProgramChangeEvent):
+                rank = 0
             else:
                 rank = 0
             return (event.time, rank)
@@ -371,6 +380,8 @@ def analyze_parseable_continuation(
     default_note_velocity: int = DEFAULT_NOTE_VELOCITY,
     default_note_duration: int = DEFAULT_NOTE_DURATION,
 ) -> ContinuationRecoveryStats:
+    """ evaluates the quality of the sent text, which is assumed to be an output from a model during training
+    returns a set of stats such as number of events, number of events where a default had to be forced in to make it work and so on"""
     count = 0
     event_candidates = 0
     default_injections = 0

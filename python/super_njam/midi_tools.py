@@ -7,7 +7,8 @@ from typing import Dict, List, Optional, Tuple
 
 import mido
 
-from .njam_v3 import ControlChangeEvent, NJamDocument, NoteEvent, PitchBendEvent, parse_document
+from .music_language import detect_language
+from .njam_v3 import ControlChangeEvent, NJamDocument, NoteEvent, PitchBendEvent, ProgramChangeEvent
 
 INSTRUMENT_PROGRAMS: Dict[str, int] = {
     "piano": 0,
@@ -100,6 +101,13 @@ def njam_to_midi(document: NJamDocument, max_note_seconds: float | None = None) 
                     mido.Message("control_change", control=event.control, value=event.value, time=0),
                 )
             )
+        elif isinstance(event, ProgramChangeEvent):
+            absolute_messages.append(
+                (
+                    event.time,
+                    mido.Message("program_change", program=event.program, channel=event.channel, time=0),
+                )
+            )
         else:
             raise AssertionError(f"Unsupported event type: {type(event)}")
 
@@ -119,7 +127,7 @@ def write_midi(document: NJamDocument, output_path: Path, max_note_seconds: floa
     midi.save(str(output_path))
 
 
-def midi_to_njam(path: Path) -> NJamDocument:
+def midi_to_njam(path: Path, include_program_changes: bool = False) -> NJamDocument:
     assert path.exists(), f"MIDI file does not exist: {path}"
     midi = mido.MidiFile(str(path))
     ppq = midi.ticks_per_beat
@@ -150,10 +158,13 @@ def midi_to_njam(path: Path) -> NJamDocument:
                 events.append(PitchBendEvent(time=absolute, value=message.pitch))
             elif message.type == "control_change":
                 events.append(ControlChangeEvent(time=absolute, control=message.control, value=message.value))
+            elif message.type == "program_change" and include_program_changes:
+                events.append(ProgramChangeEvent(time=absolute, program=message.program, channel=message.channel))
     assert events, f"No note or control events found in MIDI file: {path}"
     return NJamDocument(metadata={"ppq": str(ppq), "tempo": f"{tempo:.3f}", "sig": sig}, events=events)
 
 
 def njam_file_to_midi(input_path: Path, output_path: Path) -> None:
-    document = parse_document(input_path.read_text())
+    text = input_path.read_text()
+    document = detect_language(text).parse_document(text)
     write_midi(document, output_path)

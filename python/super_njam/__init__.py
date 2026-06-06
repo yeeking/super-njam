@@ -6,7 +6,8 @@ from .njam_v3 import (
     NJamDocument,
     NoteEvent,
     PitchBendEvent,
+    ProgramChangeEvent,
     encode_document,
     parse_document,
 )
-
+from .music_language import detect_language, get_language

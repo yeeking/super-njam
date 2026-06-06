@@ -9,6 +9,8 @@ from pathlib import Path
 
 from super_njam.training_tools import TrainConfig, run_structured_sweep
 
+LANGUAGE_CHOICES = ["njam-v3", "njam-v2", "njam-v4"]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a small structured NJam training sweep.")
@@ -17,6 +19,12 @@ def main() -> None:
         type=Path,
         required=True,
         help="Input JSONL corpus of NJamV3 solos used across all sweep runs. Expected: an existing corpus file.",
+    )
+    parser.add_argument(
+        "--language",
+        choices=LANGUAGE_CHOICES,
+        default="njam-v3",
+        help="NJam language format used in the corpus. Default: njam-v3.",
     )
     parser.add_argument(
         "--output-dir",
@@ -68,6 +76,7 @@ def main() -> None:
         max_epochs=args.max_epochs,
         learning_rate=args.learning_rate,
         soundfont_path=args.soundfont,
+        language=args.language,
     )
     results = run_structured_sweep(config, args.summary_out)
     print(json.dumps(results, indent=2, default=str))

@@ -30,16 +30,12 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 from .audio_tools import render_document_audio
 from .midi_tools import write_midi
+from .music_language import get_language
 from .njam_v3 import (
     ControlChangeEvent,
     NJamDocument,
     NoteEvent,
     PitchBendEvent,
-    analyze_parseable_continuation,
-    encode_document,
-    extract_header_metadata,
-    parse_document,
-    recover_continuation_document,
 )
 
 DEFAULT_TRAINING_SOUNDFONT = Path("soundfonts/SGM-v2.01-YamahaGrand-Guit-Bass-v2.7.sf2")
@@ -92,26 +88,33 @@ def build_sentencepiece_tokenizer(
     texts: Sequence[str],
     output_dir: Path,
     vocab_size: int = 2048,
+    model_type: str = "unigram",
+    trainer_kwargs: Optional[Dict[str, object]] = None,
 ) -> "SentencePieceTokenizerAdapter":
     assert texts, "build_sentencepiece_tokenizer requires non-empty texts."
     output_dir.mkdir(parents=True, exist_ok=True)
     corpus_path = output_dir / "sentencepiece_corpus.txt"
     corpus_path.write_text("\n".join(texts) + "\n")
     model_prefix = output_dir / "tokenizer"
-    spm.set_min_log_level(1)
+    spm.set_min_log_level(2)
+    resolved_trainer_kwargs = dict(trainer_kwargs or {})
+    byte_fallback = bool(resolved_trainer_kwargs.pop("byte_fallback", True))
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
         model_prefix=str(model_prefix),
         vocab_size=vocab_size,
-        model_type="unigram",
+        model_type=model_type,
         bos_id=1,
         eos_id=2,
         unk_id=0,
         hard_vocab_limit=False,
         max_sentence_length=1048576,
-        byte_fallback=True,
+        byte_fallback=byte_fallback,
+        **resolved_trainer_kwargs,
     )
-    return SentencePieceTokenizerAdapter(Path(str(model_prefix) + ".model"))
+    tokenizer = SentencePieceTokenizerAdapter(Path(str(model_prefix) + ".model"))
+    tokenizer.tokenizer_model_type = model_type
+    return tokenizer
 
 
 class SentencePieceTokenizerAdapter:
@@ -124,6 +127,16 @@ class SentencePieceTokenizerAdapter:
         self.unk_token_id = int(self.processor.unk_id())
         self.pad_token_id = self.eos_token_id
         self.vocab_size = int(self.processor.get_piece_size())
+        self.loss_mask_token_ids: set[int] = set()
+        self.tokenizer_model_type: str = "sentencepiece"
+        config_path = model_path.parent / "tokenizer_config.json"
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text())
+                self.loss_mask_token_ids = {int(token_id) for token_id in config.get("loss_mask_token_ids", [])}
+                self.tokenizer_model_type = str(config.get("tokenizer_model_type", self.tokenizer_model_type))
+            except Exception:
+                self.loss_mask_token_ids = set()
 
     def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
         ids = list(self.processor.encode(text, out_type=int))
@@ -166,6 +179,8 @@ class SentencePieceTokenizerAdapter:
                     "pad_token_id": self.pad_token_id,
                     "unk_token_id": self.unk_token_id,
                     "model_max_length": 1000000,
+                    "loss_mask_token_ids": sorted(int(token_id) for token_id in getattr(self, "loss_mask_token_ids", set())),
+                    "tokenizer_model_type": getattr(self, "tokenizer_model_type", "sentencepiece"),
                 },
                 indent=2,
             )
@@ -185,28 +200,12 @@ class SentencePieceTokenizerAdapter:
         )
 
 
-def njam_body_text(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("NV3|"):
-        return stripped
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    if len(lines) >= 2:
-        return "\n".join(lines[1:]).strip()
-    body_match = re.search(r"\sT[-0-9A-Z]+", stripped)
-    assert body_match is not None, "NJam text must contain body tokens after the header."
-    return stripped[body_match.start() :].strip()
+def njam_body_text(text: str, language: str = "njam-v3") -> str:
+    return get_language(language).body_text(text)
 
 
-def njam_header_text(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("NV3|"):
-        return ""
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    if lines:
-        return lines[0]
-    body_match = re.search(r"\sT[-0-9A-Z]+", stripped)
-    assert body_match is not None, "NJam text must contain body tokens after the header."
-    return stripped[: body_match.start()].strip()
+def njam_header_text(text: str, language: str = "njam-v3") -> str:
+    return get_language(language).header_text(text)
 
 
 def _prepare_solo_token_ids(
@@ -214,9 +213,10 @@ def _prepare_solo_token_ids(
     tokenizer_model_path: str,
     bos_token_id: int,
     eos_token_id: int,
+    language: str,
 ) -> Tuple[List[int], int]:
     processor = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
-    body_text = njam_body_text(text)
+    body_text = njam_body_text(text, language=language)
     token_ids = [bos_token_id] + list(processor.encode(body_text, out_type=int)) + [eos_token_id]
     assert len(token_ids) >= 2, "Each solo must yield at least one next-token target."
     return token_ids, len(token_ids) - 1
@@ -234,6 +234,7 @@ def _load_solo_token_ids(
     tokenizer: SentencePieceTokenizerAdapter,
     split_name: str,
     prep_workers: Optional[int],
+    language: str,
 ) -> Tuple[List[List[int]], List[int]]:
     assert texts, "Sliding-window datasets require non-empty texts."
     bos = tokenizer.bos_token_id
@@ -254,6 +255,7 @@ def _load_solo_token_ids(
                 tokenizer_model_path=str(tokenizer.model_path),
                 bos_token_id=bos,
                 eos_token_id=eos,
+                language=language,
             )
             solo_token_ids.append(token_ids)
             window_counts_per_solo.append(solo_window_count)
@@ -271,6 +273,7 @@ def _load_solo_token_ids(
                     str(tokenizer.model_path),
                     bos,
                     eos,
+                    language,
                 ): idx
                 for idx, text in enumerate(texts)
             }
@@ -290,7 +293,13 @@ def _load_solo_token_ids(
     return solo_token_ids, window_counts_per_solo
 
 
-def _window_sample(token_ids: List[int], end_idx: int, seq_len: int, pad_token_id: int) -> Dict[str, torch.Tensor]:
+def _window_sample(
+    token_ids: List[int],
+    end_idx: int,
+    seq_len: int,
+    pad_token_id: int,
+    loss_mask_token_ids: Optional[set[int]] = None,
+) -> Dict[str, torch.Tensor]:
     chunk = token_ids[max(0, end_idx - seq_len + 1) : end_idx + 2]
     left_pad = (seq_len + 1) - len(chunk)
     padded = ([pad_token_id] * left_pad) + chunk
@@ -301,10 +310,16 @@ def _window_sample(token_ids: List[int], end_idx: int, seq_len: int, pad_token_i
     labels = torch.tensor(padded[1:], dtype=torch.long)
     if left_pad > 0:
         labels[:left_pad] = -100
+    if loss_mask_token_ids:
+        for token_id in loss_mask_token_ids:
+            labels[labels == int(token_id)] = -100
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 class SoloSlidingWindowDataset(Dataset):
+    """Provide data as follows:
+    yield all possible windows of length seq_length on all texts
+    """
     def __init__(
         self,
         texts: Sequence[str],
@@ -312,14 +327,17 @@ class SoloSlidingWindowDataset(Dataset):
         seq_len: int,
         split_name: str = "dataset",
         prep_workers: Optional[int] = None,
+        language: str = "njam-v3",
     ):
         self.seq_len = seq_len
         self.pad_token_id = tokenizer.eos_token_id
+        self.loss_mask_token_ids = set(getattr(tokenizer, "loss_mask_token_ids", set()))
         self.solo_token_ids, self.window_counts_per_solo = _load_solo_token_ids(
             texts=texts,
             tokenizer=tokenizer,
             split_name=split_name,
             prep_workers=prep_workers,
+            language=language,
         )
         self.windows: List[Tuple[int, int]] = []
         for solo_idx, solo_window_count in enumerate(self.window_counts_per_solo):
@@ -331,10 +349,21 @@ class SoloSlidingWindowDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         solo_idx, end_idx = self.windows[idx]
-        return _window_sample(self.solo_token_ids[solo_idx], end_idx, self.seq_len, self.pad_token_id)
+        return _window_sample(
+            self.solo_token_ids[solo_idx],
+            end_idx,
+            self.seq_len,
+            self.pad_token_id,
+            self.loss_mask_token_ids,
+        )
 
 
 class SoloSlidingWindowDatasetPartial(Dataset):
+    """provides data according to the following pattern:
+    in one epoch, per text (song) provide batch_size sliding windows.
+    on the next epoch, same per text, but with an offset which is where we left off
+    
+    """
     def __init__(
         self,
         texts: Sequence[str],
@@ -344,17 +373,20 @@ class SoloSlidingWindowDatasetPartial(Dataset):
         split_name: str = "dataset",
         prep_workers: Optional[int] = None,
         randomize_each_epoch: bool = False,
+        language: str = "njam-v3",
     ):
         assert batch_size >= 1, "SoloSlidingWindowDatasetPartial requires batch_size >= 1."
         self.seq_len = seq_len
         self.batch_size = int(batch_size)
         self.pad_token_id = tokenizer.eos_token_id
+        self.loss_mask_token_ids = set(getattr(tokenizer, "loss_mask_token_ids", set()))
         self.randomize_each_epoch = randomize_each_epoch
         self.solo_token_ids, self.window_counts_per_solo = _load_solo_token_ids(
             texts=texts,
             tokenizer=tokenizer,
             split_name=split_name,
             prep_workers=prep_workers,
+            language=language,
         )
         self.window_cursors = [0 for _ in self.window_counts_per_solo]
 
@@ -369,7 +401,13 @@ class SoloSlidingWindowDatasetPartial(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         solo_idx, end_idx = self.resolve_window_index(idx)
-        return _window_sample(self.solo_token_ids[solo_idx], end_idx, self.seq_len, self.pad_token_id)
+        return _window_sample(
+            self.solo_token_ids[solo_idx],
+            end_idx,
+            self.seq_len,
+            self.pad_token_id,
+            self.loss_mask_token_ids,
+        )
 
     def advance_epoch(self) -> None:
         for solo_idx, window_count in enumerate(self.window_counts_per_solo):
@@ -411,6 +449,7 @@ class TrainConfig:
     early_stopping_patience: int = 3
     dataset_mode: str = "partial"
     validation_dataset_mode: str = "partial-random"
+    language: str = "njam-v3"
 
 
 class NJamLightningModule(L.LightningModule):
@@ -426,6 +465,7 @@ class NJamLightningModule(L.LightningModule):
         self.tokenizer = tokenizer
         self.val_samples = list(val_samples)
         self.cfg = config
+        self.language = get_language(config.language)
         self._items_seen_for_sample_render = 0
         self._next_sample_render_item_target = (
             None if config.sample_every_n_items is None else int(config.sample_every_n_items)
@@ -588,7 +628,7 @@ class NJamLightningModule(L.LightningModule):
                 path.unlink()
 
     def _slice_model_only_document(self, generated_doc: NJamDocument, prompt: str) -> Optional[NJamDocument]:
-        prompt_doc = parse_document(prompt)
+        prompt_doc = self.language.parse_document(prompt)
         prompt_event_count = len(prompt_doc.sorted_events())
         generated_events = generated_doc.sorted_events()
         if len(generated_events) <= prompt_event_count:
@@ -602,8 +642,8 @@ class NJamLightningModule(L.LightningModule):
         return NJamDocument(metadata=dict(generated_doc.metadata), events=rebased_events)
 
     def _recover_model_only_document(self, prompt: str, model_only_text: str) -> Optional[NJamDocument]:
-        metadata = extract_header_metadata(prompt)
-        return recover_continuation_document(model_only_text, metadata=metadata)
+        metadata = self.language.extract_header_metadata(prompt)
+        return self.language.recover_continuation_document(model_only_text, metadata=metadata)
 
     def _write_model_only_render_bundle(
         self,
@@ -617,7 +657,7 @@ class NJamLightningModule(L.LightningModule):
             self.current_epoch,
             sample_idx,
             "generated_model_only",
-            encode_document(document),
+            self.language.encode_document(document),
         )
         summary["generated_model_only_parse_ok"] = True
         summary["generated_model_only_paths"] = model_only_paths
@@ -630,7 +670,7 @@ class NJamLightningModule(L.LightningModule):
             summary["reference_paths"] = "written_at_epoch_0_only"
             return
         try:
-            reference_doc = parse_document(text)
+            reference_doc = self.language.parse_document(text)
             summary["reference_paths"] = self._write_render_bundle(
                 reference_doc,
                 self.current_epoch,
@@ -644,13 +684,14 @@ class NJamLightningModule(L.LightningModule):
 
     def _render_validation_sample(self, sample_idx: int, sample: Dict[str, object]) -> None:
         text = str(sample["text"])
-        body_text = njam_body_text(text)
+        body_text = njam_body_text(text, language=self.cfg.language)
         prompt = self._build_prompt(body_text)
         effective_prompt, full_body_text, model_only_text = self._generate_sample_text(prompt)
         self._log_sample_text(sample_idx, full_body_text, model_only_text)
-        model_only_recovery_stats = analyze_parseable_continuation(model_only_text).to_dict()
+        # evaluate the quality of the text we got out of the model
+        model_only_recovery_stats = self.language.analyze_parseable_continuation(model_only_text).to_dict()
         self._log_sample_metrics(sample_idx, model_only_recovery_stats)
-        header_text = njam_header_text(text)
+        header_text = njam_header_text(text, language=self.cfg.language)
         generated_text = header_text + "\n" + full_body_text.strip() + "\n"
         summary: Dict[str, object] = {
             "epoch": int(self.current_epoch),
@@ -664,7 +705,7 @@ class NJamLightningModule(L.LightningModule):
             "generated_model_only_parse_ok": False,
         }
         try:
-            generated_doc = parse_document(generated_text)
+            generated_doc = self.language.parse_document(generated_text)
             summary["generated_parse_ok"] = True
             prompt_text = header_text + "\n" + effective_prompt.strip() + "\n"
             model_only_doc = self._slice_model_only_document(generated_doc, prompt_text)
@@ -817,6 +858,7 @@ def build_sliding_window_dataset(
     split_name: str,
     mode: str,
     prep_workers: Optional[int],
+    language: str,
 ):
     if mode == "full":
         return SoloSlidingWindowDataset(
@@ -825,6 +867,7 @@ def build_sliding_window_dataset(
             seq_len,
             split_name=split_name,
             prep_workers=prep_workers,
+            language=language,
         )
     if mode in {"partial", "partial-random"}:
         return SoloSlidingWindowDatasetPartial(
@@ -835,6 +878,7 @@ def build_sliding_window_dataset(
             split_name=split_name,
             prep_workers=prep_workers,
             randomize_each_epoch=mode == "partial-random",
+            language=language,
         )
     raise AssertionError(f"Unsupported sliding-window dataset mode: {mode!r}")
 
@@ -849,6 +893,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     configure_warning_filters()
     configure_torch_runtime()
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    language = get_language(config.language)
     assert config.dataset_mode in {"partial", "full"}, "dataset_mode must be one of: partial, full."
     assert config.validation_dataset_mode in {
         "partial-random",
@@ -858,7 +903,18 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     records = load_corpus_records(config.corpus_path)
     splits = split_records_by_solo(records)
     tokenizer_dir = config.output_dir / "tokenizer"
-    tokenizer = build_sentencepiece_tokenizer([njam_body_text(str(record["text"])) for record in splits["train"]], tokenizer_dir)
+    tokenizer_model_type = getattr(language, "tokenizer_model_type", lambda: "unigram")()
+    tokenizer_train_kwargs = getattr(language, "tokenizer_train_kwargs", lambda: {})()
+    tokenizer_texts = [language.body_text(str(record["text"])) for record in splits["train"]]
+    tokenizer_texts.extend(getattr(language, "tokenizer_seed_texts", lambda: [])())
+    tokenizer = build_sentencepiece_tokenizer(
+        tokenizer_texts,
+        tokenizer_dir,
+        model_type=tokenizer_model_type,
+        trainer_kwargs=tokenizer_train_kwargs,
+    )
+    tokenizer.loss_mask_token_ids = set(getattr(language, "loss_mask_token_ids", lambda _tokenizer: set())(tokenizer))
+    tokenizer.tokenizer_model_type = tokenizer_model_type
     tokenizer.save_pretrained(str(tokenizer_dir))
     train_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["train"]],
@@ -868,6 +924,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         split_name="train",
         mode=config.dataset_mode,
         prep_workers=config.dataset_prep_workers,
+        language=language.name,
     )
     val_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["val"]],
@@ -877,6 +934,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         split_name="val",
         mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
+        language=language.name,
     )
     test_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["test"]],
@@ -886,6 +944,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         split_name="test",
         mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
+        language=language.name,
     )
 
     model_cfg = LlamaConfig(
@@ -909,7 +968,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         dirpath=str(config.output_dir / "checkpoints"),
         filename="best",
         save_top_k=1,
-        save_last=False,
+        save_last=True,
         monitor="val_loss",
         mode="min",
         save_on_train_epoch_end=False,
@@ -975,6 +1034,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     summary = {
         "best_model_path": checkpoint.best_model_path,
         "hf_model_dir": str(hf_dir),
+        "language": language.name,
         "dataset_mode": config.dataset_mode,
         "validation_dataset_mode": config.validation_dataset_mode,
         "train_windows": len(train_ds),
@@ -1002,6 +1062,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         ),
         "dataset_prep_workers": config.dataset_prep_workers,
         "tokenizer_dir": str(config.output_dir / "tokenizer"),
+        "tokenizer_model_type": tokenizer_model_type,
+        "loss_mask_token_ids": sorted(int(token_id) for token_id in tokenizer.loss_mask_token_ids),
         "config": asdict(config),
     }
     (config.output_dir / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
