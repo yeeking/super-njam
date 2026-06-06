@@ -3,7 +3,7 @@ set -euo pipefail
 
 
 # generate the corpus 
-.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus-v4-all-keys.jsonl --language njam-v4  --permute-to-all-keys 
+#.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus-v4-all-keys.jsonl --language njam-v4  --permute-to-all-keys  
 
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
@@ -11,7 +11,7 @@ CORPUS="${CORPUS:-artifacts/corpus-v4-all-keys.jsonl}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/model_grid_v4_all_keys}"
 PREFLIGHT_OUTPUT_ROOT="${PREFLIGHT_OUTPUT_ROOT:-${OUTPUT_ROOT}_preflight}"
 # PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-all}"
-PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-larger_l16_h512_heads16_ff2048}"
+PREFLIGHT_RUNS="${PREFLIGHT_RUNS:-tiny_l4_h128_heads4_ff256}"
 MAX_EPOCHS="${MAX_EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 SEQ_LEN="${SEQ_LEN:-1024}"
@@ -31,13 +31,13 @@ mkdir -p "$OUTPUT_ROOT"
 mkdir -p "$PREFLIGHT_OUTPUT_ROOT"
 
 declare -a RUNS=(
-  "larger_l16_h512_heads16_ff2048 16 512 16 2048"
-  "larger_l16_h512_heads8_ff1536 16 512 8 1536"
   "tiny_l4_h128_heads4_ff256 4 128 4 256"
   "small_l6_h192_heads6_ff384 6 192 6 384"
   "small_l8_h256_heads8_ff512 8 256 8 512"
   "medium_l10_h320_heads8_ff768 10 320 8 768"
   "medium_l12_h384_heads8_ff1024 12 384 8 1024"
+  "larger_l16_h512_heads16_ff2048 16 512 16 2048"
+  "larger_l16_h512_heads8_ff1536 16 512 8 1536"
 )
 
 should_preflight_run() {

@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import random
 
 import lightning as L
 import sentencepiece as spm
@@ -40,7 +41,7 @@ from .njam_v3 import (
 
 DEFAULT_TRAINING_SOUNDFONT = Path("soundfonts/SGM-v2.01-YamahaGrand-Guit-Bass-v2.7.sf2")
 MAX_SAMPLE_NOTE_SECONDS = 10.0
-
+MAX_TRAINING_CHARS = 60_000
 
 def load_corpus_records(corpus_path: Path) -> List[Dict[str, object]]:
     assert corpus_path.exists(), f"Corpus file does not exist: {corpus_path}"
@@ -87,20 +88,48 @@ def split_records_by_solo(
 def build_sentencepiece_tokenizer(
     texts: Sequence[str],
     output_dir: Path,
-    vocab_size: int = 2048,
+    vocab_size: int = 16000,# allows for a nice and clever tokenizer 
     model_type: str = "unigram",
     trainer_kwargs: Optional[Dict[str, object]] = None,
 ) -> "SentencePieceTokenizerAdapter":
     assert texts, "build_sentencepiece_tokenizer requires non-empty texts."
-    output_dir.mkdir(parents=True, exist_ok=True)
+    MAX_LEN = 50000
+
+    ## simple way to avoid long text lines that crash the tokenizer trainer: 
+    # for ind,t in enumerate(texts):
+    #     if len(t) > MAX_LEN: texts[ind] = t[0:MAX_LEN]
+
+    ## complex way to avoid long texts crashing the e coder 
+    # retain all text but insert line breaks to long ones
+    for ind,t in enumerate(texts):
+        if len(t) > MAX_LEN: 
+            texts[ind] = "\n".join(
+                t[i:i + MAX_LEN]
+                for i in range(0, len(t), MAX_LEN)
+            )
+
+    ## write the texts as a single corpus file
     corpus_path = output_dir / "sentencepiece_corpus.txt"
     corpus_path.write_text("\n".join(texts) + "\n")
+
+    ## write the texts to individual files in the corpus path folder
+    # corpus_files = []
+    # corpus_path = output_dir / "sp_training_corpus"
+    # corpus_path.mkdir(parents=True, exist_ok=True)
+    # for ind,t in enumerate(texts):
+    #     fname = corpus_path / f"{ind}.txt"
+    #     fname.write_text(t)
+    #     corpus_files.append(str(fname))
+    # corpus_files = ",".join(corpus_files)
+    
     model_prefix = output_dir / "tokenizer"
     spm.set_min_log_level(2)
     resolved_trainer_kwargs = dict(trainer_kwargs or {})
     byte_fallback = bool(resolved_trainer_kwargs.pop("byte_fallback", True))
+    print(f"[LOG] calling train on tokenizer. using corpus of {len(texts)} texts vocab size {vocab_size} from corpus {corpus_path}")
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
+        # input=corpus_files, 
         model_prefix=str(model_prefix),
         vocab_size=vocab_size,
         model_type=model_type,
@@ -108,7 +137,7 @@ def build_sentencepiece_tokenizer(
         eos_id=2,
         unk_id=0,
         hard_vocab_limit=False,
-        max_sentence_length=1048576,
+        # max_sentence_length=1048576,# commenting out as seems arbitrary 
         byte_fallback=byte_fallback,
         **resolved_trainer_kwargs,
     )
@@ -907,6 +936,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     tokenizer_train_kwargs = getattr(language, "tokenizer_train_kwargs", lambda: {})()
     tokenizer_texts = [language.body_text(str(record["text"])) for record in splits["train"]]
     tokenizer_texts.extend(getattr(language, "tokenizer_seed_texts", lambda: [])())
+    print(f"LOG about to build the tokenizer")
     tokenizer = build_sentencepiece_tokenizer(
         tokenizer_texts,
         tokenizer_dir,
