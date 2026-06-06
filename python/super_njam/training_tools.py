@@ -110,6 +110,7 @@ def build_sentencepiece_tokenizer(
 
     ## write the texts as a single corpus file
     corpus_path = output_dir / "sentencepiece_corpus.txt"
+    corpus_path.mkdir(parents=True, exist_ok=True)
     corpus_path.write_text("\n".join(texts) + "\n")
 
     ## write the texts to individual files in the corpus path folder
