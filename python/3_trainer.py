@@ -150,6 +150,18 @@ def main() -> None:
         default=3,
         help="Validation checks without a new best val_loss before stopping training. Expected range: integers >= 0; default 3.",
     )
+    parser.add_argument(
+        "--dataset-mode",
+        choices=["partial", "full"],
+        default="partial",
+        help="Training dataset epoch mode. partial gives one batch per solo per epoch; full preserves exhaustive sliding-window epochs.",
+    )
+    parser.add_argument(
+        "--validation-dataset-mode",
+        choices=["partial-random", "partial", "full"],
+        default="partial-random",
+        help="Validation dataset epoch mode. partial-random samples one random batch per solo each validation epoch; full validates every window.",
+    )
     args = parser.parse_args()
     output_dir = args.output_dir if args.output_dir is not None else _default_output_dir(args)
     config = TrainConfig(
@@ -173,6 +185,8 @@ def main() -> None:
         validation_preflight=args.validation_preflight,
         validation_preflight_val_batches=args.validation_preflight_val_batches,
         early_stopping_patience=args.early_stopping_patience,
+        dataset_mode=args.dataset_mode,
+        validation_dataset_mode=args.validation_dataset_mode,
     )
     summary = run_training(config)
     summary["resolved_output_dir"] = str(output_dir)

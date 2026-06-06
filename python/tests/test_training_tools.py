@@ -1,17 +1,21 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from torch.utils.data import DataLoader
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from super_njam.training_tools import (
     NJamLightningModule,
     SentencePieceTokenizerAdapter,
     SoloSlidingWindowDataset,
+    SoloSlidingWindowDatasetPartial,
     TrainConfig,
     build_sentencepiece_tokenizer,
     njam_body_text,
     njam_header_text,
+    split_records_by_solo,
 )
 
 
@@ -25,6 +29,13 @@ class SlidingWindowDatasetTests(unittest.TestCase):
         text = "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 C1,2O\n"
         self.assertEqual(njam_header_text(text), "NV3|ppq=96|tempo=120|sig=4/4")
         self.assertEqual(njam_body_text(text), "T0 N1Y,3C,11 T1 C1,2O")
+
+    def test_tiny_corpus_split_keeps_all_partitions_nonempty(self) -> None:
+        records = [{"melid": idx, "text": "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11\n"} for idx in range(5)]
+        splits = split_records_by_solo(records)
+        self.assertEqual(len(splits["train"]), 3)
+        self.assertEqual(len(splits["val"]), 1)
+        self.assertEqual(len(splits["test"]), 1)
 
     def test_dataset_never_crosses_solo_boundaries(self) -> None:
         texts = [
@@ -66,6 +77,64 @@ class SlidingWindowDatasetTests(unittest.TestCase):
         last = dataset[len(dataset) - 1]
         self.assertIn(tokenizer.bos_token_id, first["input_ids"].tolist())
         self.assertEqual(int(last["labels"][-1].item()), tokenizer.eos_token_id)
+
+    def test_partial_dataset_epoch_has_one_batch_per_solo(self) -> None:
+        texts = [
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 N20,3C,11\n",
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N30,3C,11 T1 N31,3C,11\n",
+        ]
+        tokenizer = self._build_tokenizer([njam_body_text(text) for text in texts])
+        dataset = SoloSlidingWindowDatasetPartial(texts, tokenizer, seq_len=8, batch_size=3)
+        self.assertEqual(len(dataset), len(texts) * 3)
+        self.assertEqual(len(DataLoader(dataset, batch_size=3, shuffle=False)), len(texts))
+
+    def test_partial_dataset_returns_single_window_samples(self) -> None:
+        text = "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 N20,3C,11\n"
+        tokenizer = self._build_tokenizer([njam_body_text(text)])
+        dataset = SoloSlidingWindowDatasetPartial([text], tokenizer, seq_len=8, batch_size=4)
+        sample = dataset[0]
+        self.assertEqual(tuple(sample["input_ids"].shape), (8,))
+        self.assertEqual(tuple(sample["attention_mask"].shape), (8,))
+        self.assertEqual(tuple(sample["labels"].shape), (8,))
+
+    def test_partial_dataset_maps_contiguous_blocks_to_one_solo(self) -> None:
+        texts = [
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 N20,3C,11\n",
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N30,3C,11 T1 N31,3C,11\n",
+        ]
+        tokenizer = self._build_tokenizer([njam_body_text(text) for text in texts])
+        dataset = SoloSlidingWindowDatasetPartial(texts, tokenizer, seq_len=8, batch_size=3)
+        self.assertEqual([dataset.resolve_window_index(idx)[0] for idx in range(3)], [0, 0, 0])
+        self.assertEqual([dataset.resolve_window_index(idx)[0] for idx in range(3, 6)], [1, 1, 1])
+
+    def test_partial_dataset_advance_epoch_wraps_per_solo(self) -> None:
+        text = "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 N20,3C,11\n"
+        tokenizer = self._build_tokenizer([njam_body_text(text)])
+        dataset = SoloSlidingWindowDatasetPartial([text], tokenizer, seq_len=8, batch_size=2)
+        window_count = dataset.window_counts_per_solo[0]
+        self.assertGreater(window_count, 2)
+        first_epoch = [dataset.resolve_window_index(idx)[1] for idx in range(2)]
+        dataset.advance_epoch()
+        second_epoch = [dataset.resolve_window_index(idx)[1] for idx in range(2)]
+        self.assertEqual(first_epoch, [0, 1])
+        self.assertEqual(second_epoch, [2 % window_count, 3 % window_count])
+
+    def test_partial_random_validation_chooses_random_cursor(self) -> None:
+        texts = [
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 N20,3C,11\n",
+            "NV3|ppq=96|tempo=120|sig=4/4\nT0 N30,3C,11 T1 N31,3C,11\n",
+        ]
+        tokenizer = self._build_tokenizer([njam_body_text(text) for text in texts])
+        dataset = SoloSlidingWindowDatasetPartial(
+            texts,
+            tokenizer,
+            seq_len=8,
+            batch_size=2,
+            randomize_each_epoch=True,
+        )
+        with mock.patch("super_njam.training_tools.random.randrange", side_effect=[1, 2]):
+            dataset.prepare_validation_epoch()
+        self.assertEqual(dataset.window_cursors, [1, 2])
 
     def test_prompt_truncation_keeps_nonempty_njam_tokens(self) -> None:
         text = (

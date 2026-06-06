@@ -6,8 +6,10 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
+import warnings
 from dataclasses import dataclass, asdict
 import math
 from pathlib import Path
@@ -72,7 +74,17 @@ def split_records_by_solo(
             buckets["val"].append(record)
         else:
             buckets["test"].append(record)
-    assert buckets["train"] and buckets["val"] and buckets["test"], "Split produced an empty partition."
+    if not (buckets["train"] and buckets["val"] and buckets["test"]):
+        assert len(records) >= 3, "At least 3 solos are required to create train/val/test splits."
+        sorted_records = sorted(
+            records,
+            key=lambda record: hashlib.sha1(str(record["melid"]).encode("utf-8")).hexdigest(),
+        )
+        buckets = {
+            "train": list(sorted_records[:-2]),
+            "val": [sorted_records[-2]],
+            "test": [sorted_records[-1]],
+        }
     return buckets
 
 
@@ -86,6 +98,7 @@ def build_sentencepiece_tokenizer(
     corpus_path = output_dir / "sentencepiece_corpus.txt"
     corpus_path.write_text("\n".join(texts) + "\n")
     model_prefix = output_dir / "tokenizer"
+    spm.set_min_log_level(1)
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
         model_prefix=str(model_prefix),
@@ -216,6 +229,81 @@ def _build_dataset_executor(max_workers: int):
         return ThreadPoolExecutor(max_workers=max_workers), "thread"
 
 
+def _load_solo_token_ids(
+    texts: Sequence[str],
+    tokenizer: SentencePieceTokenizerAdapter,
+    split_name: str,
+    prep_workers: Optional[int],
+) -> Tuple[List[List[int]], List[int]]:
+    assert texts, "Sliding-window datasets require non-empty texts."
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    assert bos is not None and eos is not None, "Tokenizer must define BOS and EOS tokens."
+    solo_token_ids: List[List[int]] = []
+    window_counts_per_solo: List[int] = []
+    progress = (
+        tqdm(total=len(texts), desc=f"Preparing {split_name} windows", unit="solo", leave=False, dynamic_ncols=True)
+        if tqdm is not None
+        else None
+    )
+    worker_count = 1 if prep_workers is None else min(len(texts), max(1, int(prep_workers)))
+    if worker_count <= 1:
+        for text in texts:
+            token_ids, solo_window_count = _prepare_solo_token_ids(
+                text=text,
+                tokenizer_model_path=str(tokenizer.model_path),
+                bos_token_id=bos,
+                eos_token_id=eos,
+            )
+            solo_token_ids.append(token_ids)
+            window_counts_per_solo.append(solo_window_count)
+            if progress is not None:
+                progress.update(1)
+    else:
+        ordered_results: List[Optional[Tuple[List[int], int]]] = [None] * len(texts)
+        executor, executor_kind = _build_dataset_executor(worker_count)
+        print(f"Preparing {split_name} windows with {executor_kind} pool ({worker_count} workers)")
+        with executor:
+            future_to_index = {
+                executor.submit(
+                    _prepare_solo_token_ids,
+                    text,
+                    str(tokenizer.model_path),
+                    bos,
+                    eos,
+                ): idx
+                for idx, text in enumerate(texts)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                ordered_results[idx] = future.result()
+                if progress is not None:
+                    progress.update(1)
+        for result in ordered_results:
+            assert result is not None
+            token_ids, solo_window_count = result
+            solo_token_ids.append(token_ids)
+            window_counts_per_solo.append(solo_window_count)
+    if progress is not None:
+        progress.close()
+    assert sum(window_counts_per_solo) > 0, "Sliding window construction produced zero samples."
+    return solo_token_ids, window_counts_per_solo
+
+
+def _window_sample(token_ids: List[int], end_idx: int, seq_len: int, pad_token_id: int) -> Dict[str, torch.Tensor]:
+    chunk = token_ids[max(0, end_idx - seq_len + 1) : end_idx + 2]
+    left_pad = (seq_len + 1) - len(chunk)
+    padded = ([pad_token_id] * left_pad) + chunk
+    input_ids = torch.tensor(padded[:-1], dtype=torch.long)
+    attention_mask = torch.ones(seq_len, dtype=torch.long)
+    if left_pad > 0:
+        attention_mask[:left_pad] = 0
+    labels = torch.tensor(padded[1:], dtype=torch.long)
+    if left_pad > 0:
+        labels[:left_pad] = -100
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
 class SoloSlidingWindowDataset(Dataset):
     def __init__(
         self,
@@ -225,64 +313,17 @@ class SoloSlidingWindowDataset(Dataset):
         split_name: str = "dataset",
         prep_workers: Optional[int] = None,
     ):
-        assert texts, "SoloSlidingWindowDataset requires non-empty texts."
-        bos = tokenizer.bos_token_id
-        eos = tokenizer.eos_token_id
-        assert bos is not None and eos is not None, "Tokenizer must define BOS and EOS tokens."
         self.seq_len = seq_len
-        self.pad_token_id = eos
-        self.solo_token_ids: List[List[int]] = []
-        self.windows: List[Tuple[int, int]] = []
-        self.window_counts_per_solo: List[int] = []
-        progress = (
-            tqdm(total=len(texts), desc=f"Preparing {split_name} windows", unit="solo", leave=False, dynamic_ncols=True)
-            if tqdm is not None
-            else None
+        self.pad_token_id = tokenizer.eos_token_id
+        self.solo_token_ids, self.window_counts_per_solo = _load_solo_token_ids(
+            texts=texts,
+            tokenizer=tokenizer,
+            split_name=split_name,
+            prep_workers=prep_workers,
         )
-        worker_count = 1 if prep_workers is None else min(len(texts), max(1, int(prep_workers)))
-        if worker_count <= 1:
-            for text in texts:
-                token_ids, solo_window_count = _prepare_solo_token_ids(
-                    text=text,
-                    tokenizer_model_path=str(tokenizer.model_path),
-                    bos_token_id=bos,
-                    eos_token_id=eos,
-                )
-                solo_idx = len(self.solo_token_ids)
-                self.solo_token_ids.append(token_ids)
-                self.windows.extend((solo_idx, end_idx) for end_idx in range(solo_window_count))
-                self.window_counts_per_solo.append(solo_window_count)
-                if progress is not None:
-                    progress.update(1)
-        else:
-            ordered_results: List[Optional[Tuple[List[int], int]]] = [None] * len(texts)
-            executor, executor_kind = _build_dataset_executor(worker_count)
-            print(f"Preparing {split_name} windows with {executor_kind} pool ({worker_count} workers)")
-            with executor:
-                future_to_index = {
-                    executor.submit(
-                        _prepare_solo_token_ids,
-                        text,
-                        str(tokenizer.model_path),
-                        bos,
-                        eos,
-                    ): idx
-                    for idx, text in enumerate(texts)
-                }
-                for future in as_completed(future_to_index):
-                    idx = future_to_index[future]
-                    ordered_results[idx] = future.result()
-                    if progress is not None:
-                        progress.update(1)
-            for result in ordered_results:
-                assert result is not None
-                token_ids, solo_window_count = result
-                solo_idx = len(self.solo_token_ids)
-                self.solo_token_ids.append(token_ids)
-                self.windows.extend((solo_idx, end_idx) for end_idx in range(solo_window_count))
-                self.window_counts_per_solo.append(solo_window_count)
-        if progress is not None:
-            progress.close()
+        self.windows: List[Tuple[int, int]] = []
+        for solo_idx, solo_window_count in enumerate(self.window_counts_per_solo):
+            self.windows.extend((solo_idx, end_idx) for end_idx in range(solo_window_count))
         assert self.windows, "Sliding window construction produced zero samples."
 
     def __len__(self) -> int:
@@ -290,18 +331,60 @@ class SoloSlidingWindowDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         solo_idx, end_idx = self.windows[idx]
-        token_ids = self.solo_token_ids[solo_idx]
-        chunk = token_ids[max(0, end_idx - self.seq_len + 1) : end_idx + 2]
-        left_pad = (self.seq_len + 1) - len(chunk)
-        padded = ([self.pad_token_id] * left_pad) + chunk
-        input_ids = torch.tensor(padded[:-1], dtype=torch.long)
-        attention_mask = torch.ones(self.seq_len, dtype=torch.long)
-        if left_pad > 0:
-            attention_mask[:left_pad] = 0
-        labels = torch.tensor(padded[1:], dtype=torch.long)
-        if left_pad > 0:
-            labels[:left_pad] = -100
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        return _window_sample(self.solo_token_ids[solo_idx], end_idx, self.seq_len, self.pad_token_id)
+
+
+class SoloSlidingWindowDatasetPartial(Dataset):
+    def __init__(
+        self,
+        texts: Sequence[str],
+        tokenizer: SentencePieceTokenizerAdapter,
+        seq_len: int,
+        batch_size: int,
+        split_name: str = "dataset",
+        prep_workers: Optional[int] = None,
+        randomize_each_epoch: bool = False,
+    ):
+        assert batch_size >= 1, "SoloSlidingWindowDatasetPartial requires batch_size >= 1."
+        self.seq_len = seq_len
+        self.batch_size = int(batch_size)
+        self.pad_token_id = tokenizer.eos_token_id
+        self.randomize_each_epoch = randomize_each_epoch
+        self.solo_token_ids, self.window_counts_per_solo = _load_solo_token_ids(
+            texts=texts,
+            tokenizer=tokenizer,
+            split_name=split_name,
+            prep_workers=prep_workers,
+        )
+        self.window_cursors = [0 for _ in self.window_counts_per_solo]
+
+    def __len__(self) -> int:
+        return len(self.solo_token_ids) * self.batch_size
+
+    def resolve_window_index(self, idx: int) -> Tuple[int, int]:
+        solo_idx = idx // self.batch_size
+        offset = idx % self.batch_size
+        window_count = self.window_counts_per_solo[solo_idx]
+        return solo_idx, (self.window_cursors[solo_idx] + offset) % window_count
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        solo_idx, end_idx = self.resolve_window_index(idx)
+        return _window_sample(self.solo_token_ids[solo_idx], end_idx, self.seq_len, self.pad_token_id)
+
+    def advance_epoch(self) -> None:
+        for solo_idx, window_count in enumerate(self.window_counts_per_solo):
+            self.window_cursors[solo_idx] = (self.window_cursors[solo_idx] + self.batch_size) % window_count
+
+    def reset_cursors(self) -> None:
+        self.window_cursors = [0 for _ in self.window_counts_per_solo]
+
+    def prepare_validation_epoch(self) -> None:
+        if self.randomize_each_epoch:
+            self.window_cursors = [random.randrange(window_count) for window_count in self.window_counts_per_solo]
+
+    def finish_validation_epoch(self) -> None:
+        if not self.randomize_each_epoch:
+            self.advance_epoch()
 
 
 @dataclass
@@ -326,6 +409,8 @@ class TrainConfig:
     validation_preflight: bool = False
     validation_preflight_val_batches: int = 1
     early_stopping_patience: int = 3
+    dataset_mode: str = "partial"
+    validation_dataset_mode: str = "partial-random"
 
 
 class NJamLightningModule(L.LightningModule):
@@ -346,6 +431,8 @@ class NJamLightningModule(L.LightningModule):
             None if config.sample_every_n_items is None else int(config.sample_every_n_items)
         )
         self._reference_written_sample_indices: set[int] = set()
+        self.train_dataset = None
+        self.val_dataset = None
         self.save_hyperparameters(ignore=["model", "tokenizer", "val_samples"])
 
     def _sample_prefix(self, epoch: int, sample_idx: int) -> str:
@@ -631,6 +718,18 @@ class NJamLightningModule(L.LightningModule):
             self._render_validation_sample(idx, sample)
         self._next_sample_render_item_target += int(self.cfg.sample_every_n_items)
 
+    def on_train_epoch_end(self) -> None:
+        if hasattr(self.train_dataset, "advance_epoch"):
+            self.train_dataset.advance_epoch()
+
+    def on_validation_epoch_start(self) -> None:
+        if hasattr(self.val_dataset, "prepare_validation_epoch"):
+            self.val_dataset.prepare_validation_epoch()
+
+    def _finish_validation_dataset_epoch(self) -> None:
+        if hasattr(self.val_dataset, "finish_validation_epoch"):
+            self.val_dataset.finish_validation_epoch()
+
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
         loss = outputs.loss
@@ -640,15 +739,18 @@ class NJamLightningModule(L.LightningModule):
         return loss
 
     def on_validation_epoch_end(self) -> None:
-        if not self.val_samples:
-            return
-        if self.cfg.sample_every_n_items is not None:
-            return
-        assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
-        if self.current_epoch % self.cfg.sample_every_n_epochs != 0:
-            return
-        for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
-            self._render_validation_sample(idx, sample)
+        try:
+            if not self.val_samples:
+                return
+            if self.cfg.sample_every_n_items is not None:
+                return
+            assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
+            if self.current_epoch % self.cfg.sample_every_n_epochs != 0:
+                return
+            for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
+                self._render_validation_sample(idx, sample)
+        finally:
+            self._finish_validation_dataset_epoch()
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.cfg.learning_rate)
@@ -672,6 +774,18 @@ def configure_torch_runtime() -> None:
             torch.backends.cudnn.allow_tf32 = True
 
 
+def configure_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*`isinstance\(treespec, LeafSpec\)` is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*The '.*_dataloader' does not have many workers.*",
+        module=r"lightning\.pytorch\.trainer\.connectors\.data_connector",
+    )
+
+
 def detect_accelerator() -> Dict[str, object]:
     if torch.cuda.is_available():
         return {"accelerator": "gpu", "devices": 1, "precision": "16-mixed"}
@@ -691,33 +805,86 @@ def dataloader_kwargs() -> Dict[str, object]:
     return {"num_workers": 0, "pin_memory": False}
 
 
+def partial_dataloader_kwargs() -> Dict[str, object]:
+    return {"num_workers": 0, "pin_memory": torch.cuda.is_available()}
+
+
+def build_sliding_window_dataset(
+    texts: Sequence[str],
+    tokenizer: SentencePieceTokenizerAdapter,
+    seq_len: int,
+    batch_size: int,
+    split_name: str,
+    mode: str,
+    prep_workers: Optional[int],
+):
+    if mode == "full":
+        return SoloSlidingWindowDataset(
+            texts,
+            tokenizer,
+            seq_len,
+            split_name=split_name,
+            prep_workers=prep_workers,
+        )
+    if mode in {"partial", "partial-random"}:
+        return SoloSlidingWindowDatasetPartial(
+            texts,
+            tokenizer,
+            seq_len,
+            batch_size=batch_size,
+            split_name=split_name,
+            prep_workers=prep_workers,
+            randomize_each_epoch=mode == "partial-random",
+        )
+    raise AssertionError(f"Unsupported sliding-window dataset mode: {mode!r}")
+
+
+def dataset_dataloader_kwargs(dataset) -> Dict[str, object]:
+    if isinstance(dataset, SoloSlidingWindowDatasetPartial):
+        return partial_dataloader_kwargs()
+    return dataloader_kwargs()
+
+
 def run_training(config: TrainConfig) -> Dict[str, object]:
+    configure_warning_filters()
     configure_torch_runtime()
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    assert config.dataset_mode in {"partial", "full"}, "dataset_mode must be one of: partial, full."
+    assert config.validation_dataset_mode in {
+        "partial-random",
+        "partial",
+        "full",
+    }, "validation_dataset_mode must be one of: partial-random, partial, full."
     records = load_corpus_records(config.corpus_path)
     splits = split_records_by_solo(records)
     tokenizer_dir = config.output_dir / "tokenizer"
     tokenizer = build_sentencepiece_tokenizer([njam_body_text(str(record["text"])) for record in splits["train"]], tokenizer_dir)
     tokenizer.save_pretrained(str(tokenizer_dir))
-    train_ds = SoloSlidingWindowDataset(
+    train_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["train"]],
         tokenizer,
         config.seq_len,
+        batch_size=config.batch_size,
         split_name="train",
+        mode=config.dataset_mode,
         prep_workers=config.dataset_prep_workers,
     )
-    val_ds = SoloSlidingWindowDataset(
+    val_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["val"]],
         tokenizer,
         config.seq_len,
+        batch_size=config.batch_size,
         split_name="val",
+        mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
     )
-    test_ds = SoloSlidingWindowDataset(
+    test_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["test"]],
         tokenizer,
         config.seq_len,
+        batch_size=config.batch_size,
         split_name="test",
+        mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
     )
 
@@ -735,6 +902,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     )
     model = LlamaForCausalLM(model_cfg)
     module = NJamLightningModule(model=model, tokenizer=tokenizer, val_samples=splits["val"], config=config)
+    module.train_dataset = train_ds
+    module.val_dataset = val_ds
     logger = TensorBoardLogger(save_dir=str(config.output_dir), name="tensorboard")
     checkpoint = ModelCheckpoint(
         dirpath=str(config.output_dir / "checkpoints"),
@@ -752,10 +921,20 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         patience=config.early_stopping_patience,
     )
     def make_train_loader() -> DataLoader:
-        return DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, **dataloader_kwargs())
+        return DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            shuffle=not isinstance(train_ds, SoloSlidingWindowDatasetPartial),
+            **dataset_dataloader_kwargs(train_ds),
+        )
 
     def make_val_loader() -> DataLoader:
-        return DataLoader(val_ds, batch_size=config.batch_size, **dataloader_kwargs())
+        return DataLoader(
+            val_ds,
+            batch_size=config.batch_size,
+            shuffle=False,
+            **dataset_dataloader_kwargs(val_ds),
+        )
 
     accelerator_kwargs = detect_accelerator()
     if config.validation_preflight:
@@ -772,6 +951,9 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
             **accelerator_kwargs,
         )
         preflight_trainer.fit(module, make_train_loader(), make_val_loader())
+        for dataset in (train_ds, val_ds):
+            if hasattr(dataset, "reset_cursors"):
+                dataset.reset_cursors()
 
     trainer_kwargs = {"max_epochs": config.max_epochs}
     if config.validation_preflight:
@@ -793,10 +975,16 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     summary = {
         "best_model_path": checkpoint.best_model_path,
         "hf_model_dir": str(hf_dir),
-        "dataset_mode": "solo_sliding",
+        "dataset_mode": config.dataset_mode,
+        "validation_dataset_mode": config.validation_dataset_mode,
         "train_windows": len(train_ds),
         "val_windows": len(val_ds),
         "test_windows": len(test_ds),
+        "train_possible_windows": sum(train_ds.window_counts_per_solo),
+        "val_possible_windows": sum(val_ds.window_counts_per_solo),
+        "test_possible_windows": sum(test_ds.window_counts_per_solo),
+        "train_epoch_steps": math.ceil(len(train_ds) / config.batch_size),
+        "val_epoch_steps": math.ceil(len(val_ds) / config.batch_size),
         "mean_train_windows_per_solo": (sum(train_ds.window_counts_per_solo) / len(train_ds.window_counts_per_solo)),
         "mean_val_windows_per_solo": (sum(val_ds.window_counts_per_solo) / len(val_ds.window_counts_per_solo)),
         "mean_test_windows_per_solo": (sum(test_ds.window_counts_per_solo) / len(test_ds.window_counts_per_solo)),
