@@ -4,6 +4,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from super_njam import njam_v4
+from super_njam.generation_tools import (
+    FREE,
+    NOTE_DURATION,
+    NOTE_DURATION_TAIL,
+    NOTE_PITCH,
+    NOTE_VELOCITY,
+    advance_njam_v4_grammar_state,
+    njam_v4_piece_is_allowed,
+)
 from super_njam.music_language import detect_language, get_language
 from super_njam.njam_v3 import (
     ControlChangeEvent,
@@ -51,6 +60,15 @@ class NJamV4Tests(unittest.TestCase):
         self.assertEqual(parsed.events[4].time, 144)
         self.assertEqual(parsed.events[4].duration, 192)
 
+    def test_encoded_body_is_compact_but_spaced_legacy_body_still_parses(self) -> None:
+        text = njam_v4.encode_document(self._document())
+        body = njam_v4.body_text(text)
+        self.assertNotIn(" ", body)
+
+        legacy_text = njam_v4.header_text(text) + "\n" + " ".join(body) + "\n"
+        parsed = njam_v4.parse_document(legacy_text)
+        self.assertEqual(len(parsed.events), len(self._document().events))
+
     def test_quantizers_stay_in_midi_ranges(self) -> None:
         for value in (-10, 0, 1, 63, 127, 200):
             self.assertGreaterEqual(njam_v4.bin_to_velocity(njam_v4.velocity_to_bin(value)), 1)
@@ -91,6 +109,38 @@ class NJamV4Tests(unittest.TestCase):
         self.assertTrue(any(ch in njam_v4.body_text(controlled_text) for ch in njam_v4.control_token_chars()))
         self.assertEqual(len(njam_v4.parse_document(controlled_text).events), 1)
 
+    def test_chord_normalization_handles_jazz_spellings(self) -> None:
+        cases = {
+            "C": (0, "maj"),
+            "C-": (0, "min"),
+            "C-7": (0, "min7"),
+            "Cm": (0, "min"),
+            "Cm7": (0, "min7"),
+            "C7": (0, "7"),
+            "Cmaj7": (0, "maj7"),
+            "Cø": (0, "hdim"),
+            "Cm7b5": (0, "hdim"),
+        }
+        for chord, expected in cases.items():
+            with self.subTest(chord=chord):
+                self.assertEqual(njam_v4._parse_chord(chord), expected)
+
+    def test_chord_controls_are_conditioning_tokens_not_roundtrip_events(self) -> None:
+        document = NJamDocument(metadata={"ppq": "96"}, events=[NoteEvent(time=0, pitch=60, velocity=80, duration=24)])
+        fake_solo = SimpleNamespace(
+            beats=[
+                SimpleNamespace(onset=0.0, chord="Cmaj7"),
+                SimpleNamespace(onset=0.5, chord="Cmaj7"),
+            ]
+        )
+        controlled = njam_v4.with_weimar_controls(document, fake_solo)
+        self.assertEqual(len(njam_v4._controls_from_metadata(controlled.metadata)), 2)
+        parsed = njam_v4.parse_document(njam_v4.encode_document(controlled))
+        self.assertEqual(len(parsed.events), len(document.events))
+        self.assertEqual(parsed.events[0].time, document.events[0].time)
+        self.assertEqual(parsed.events[0].pitch, document.events[0].pitch)
+        self.assertEqual(parsed.events[0].duration, document.events[0].duration)
+
     def test_recovery_stats_handle_malformed_continuations(self) -> None:
         body = njam_v4.body_text(njam_v4.encode_document(self._document()))
         damaged = body[: len(body) // 2]
@@ -125,6 +175,14 @@ class NJamV4Tests(unittest.TestCase):
             masked_counts = [int((dataset[idx]["labels"] == -100).sum().item()) for idx in range(len(dataset))]
             self.assertTrue(any(count > 0 for count in masked_counts))
 
+    def test_v4_bpe_training_kwargs_use_long_compact_pieces_and_required_chars(self) -> None:
+        language = get_language("njam-v4")
+        kwargs = language.tokenizer_train_kwargs()
+        self.assertEqual(kwargs["max_sentencepiece_length"], 32)
+        self.assertFalse(kwargs["add_dummy_prefix"])
+        self.assertFalse(kwargs["byte_fallback"])
+        self.assertEqual(kwargs["required_chars"], "".join(njam_v4.base_token_chars(include_controls=True)))
+
     def test_tokenizer_seed_covers_unobserved_base_tokens(self) -> None:
         language = get_language("njam-v4")
         text = njam_v4.body_text(
@@ -153,6 +211,50 @@ class NJamV4Tests(unittest.TestCase):
                 trainer_kwargs=language.tokenizer_train_kwargs(),
             )
             self.assertNotIn(tokenizer.unk_token_id, tokenizer.encode(unseen_prompt))
+
+    def test_compact_bpe_learns_long_pieces_without_seed_adjacency_artifacts(self) -> None:
+        language = get_language("njam-v4")
+        body = language.body_text(language.encode_document(self._document()))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tokenizer = build_sentencepiece_tokenizer(
+                [body] * 32 + language.tokenizer_seed_texts(),
+                Path(tmpdir),
+                vocab_size=1024,
+                model_type=language.tokenizer_model_type(),
+                trainer_kwargs=language.tokenizer_train_kwargs(),
+            )
+            pieces = [tokenizer.processor.id_to_piece(idx) for idx in range(tokenizer.vocab_size)]
+            max_piece_primitives = max(len(njam_v4.piece_debug_names(piece)) for piece in pieces)
+            self.assertGreater(max_piece_primitives, 8)
+            for piece in pieces:
+                names = njam_v4.piece_debug_names(piece)
+                if any(name.startswith("root_") or name.startswith("chord_") for name in names):
+                    self.assertEqual(len(names), 1)
+
+    def test_v4_grammar_blocks_malformed_note_transitions(self) -> None:
+        self.assertEqual(advance_njam_v4_grammar_state(FREE, njam_v4.NOTE), NOTE_PITCH)
+        self.assertIsNone(advance_njam_v4_grammar_state(NOTE_PITCH, njam_v4.TIME_BASE))
+        self.assertIsNone(advance_njam_v4_grammar_state(NOTE_PITCH, njam_v4.VELOCITY_BASE))
+        self.assertEqual(advance_njam_v4_grammar_state(NOTE_PITCH, njam_v4.PITCH_BASE + 60), NOTE_VELOCITY)
+        self.assertIsNone(advance_njam_v4_grammar_state(NOTE_VELOCITY, njam_v4.DURATION_BASE))
+        self.assertEqual(advance_njam_v4_grammar_state(NOTE_VELOCITY, njam_v4.VELOCITY_BASE + 10), NOTE_DURATION)
+        self.assertEqual(advance_njam_v4_grammar_state(NOTE_DURATION, njam_v4.DURATION_BASE + 3), NOTE_DURATION_TAIL)
+        self.assertEqual(advance_njam_v4_grammar_state(NOTE_DURATION_TAIL, njam_v4.NOTE), NOTE_PITCH)
+
+    def test_v4_grammar_validates_whole_bpe_pieces(self) -> None:
+        valid_note_piece = [
+            njam_v4.NOTE,
+            njam_v4.PITCH_BASE + 60,
+            njam_v4.VELOCITY_BASE + 10,
+            njam_v4.DURATION_BASE + 7,
+        ]
+        self.assertTrue(njam_v4_piece_is_allowed(valid_note_piece, FREE))
+        self.assertFalse(njam_v4_piece_is_allowed([njam_v4.NOTE, njam_v4.TIME_BASE], FREE))
+        self.assertFalse(njam_v4_piece_is_allowed([njam_v4.NOTE, njam_v4.VELOCITY_BASE], FREE))
+        self.assertFalse(njam_v4_piece_is_allowed([njam_v4.PITCH_BASE + 60], FREE))
+        self.assertTrue(njam_v4_piece_is_allowed([njam_v4.TIME_BASE, njam_v4.NOTE], FREE))
+        self.assertTrue(njam_v4_piece_is_allowed([njam_v4.PITCH_BASE + 60], NOTE_PITCH))
+        self.assertFalse(njam_v4_piece_is_allowed([njam_v4.DURATION_BASE], NOTE_VELOCITY))
 
 
 if __name__ == "__main__":

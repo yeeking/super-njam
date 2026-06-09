@@ -132,8 +132,8 @@ def base_token_chars(include_controls: bool = True) -> List[str]:
     return chars
 
 
-def base_vocabulary_seed_text(include_controls: bool = True) -> str:
-    return " ".join(base_token_chars(include_controls=include_controls))
+def base_vocabulary_seed_texts(include_controls: bool = True) -> List[str]:
+    return base_token_chars(include_controls=include_controls)
 
 
 def is_control_token_char(ch: str) -> bool:
@@ -303,14 +303,21 @@ def extract_header_metadata(text: str) -> Dict[str, str]:
 
 
 def _normalize_chord_type(raw: str) -> str:
-    value = raw.strip().lower().replace("-", "").replace("_", "")
+    suffix = raw.strip().lower()
+    if suffix in {"-", "-m", "-min", "−", "−m", "−min"}:
+        return "min"
+    if suffix in {"-7", "-m7", "-min7", "−7", "−m7", "−min7"}:
+        return "min7"
+    if suffix in {"ø", "ø7"}:
+        return "hdim"
+    value = suffix.replace("-", "").replace("−", "").replace("_", "")
     if value in {"", "ma", "maj", "major", "6", "69"}:
         return "maj"
-    if value in {"m", "mi", "min", "minor", "-"}:
+    if value in {"m", "mi", "min", "minor"}:
         return "min"
     if "maj7" in value or "ma7" in value:
         return "maj7"
-    if "m7b5" in value or "half" in value:
+    if "m7b5" in value or "mi7b5" in value or "min7b5" in value or "half" in value:
         return "hdim"
     if "min7" in value or "mi7" in value or value == "m7":
         return "min7"
@@ -434,7 +441,7 @@ def encode_document(document: NJamDocument) -> str:
         else:
             tokens.extend(_encode_event(payload))
     tokens.append(_char(END))
-    return _encode_header(document.metadata) + "\n" + " ".join(tokens) + "\n"
+    return _encode_header(document.metadata) + "\n" + "".join(tokens) + "\n"
 
 
 def _consume_duration(chars: Sequence[str], idx: int) -> tuple[int, int]:
@@ -628,6 +635,10 @@ def token_debug_name(ch: str) -> str:
     return f"token_{token_id}"
 
 
+def piece_debug_names(piece: str) -> List[str]:
+    return [token_debug_name(ch) for ch in piece if _token_id(ch) is not None]
+
+
 __all__ = [
     "DEFAULT_PPQ",
     "HEADER_PREFIX",
@@ -636,6 +647,8 @@ __all__ = [
     "bin_to_cc_value",
     "bin_to_velocity",
     "body_text",
+    "base_token_chars",
+    "base_vocabulary_seed_texts",
     "cc_value_to_bin",
     "control_token_chars",
     "encode_document",
@@ -643,6 +656,7 @@ __all__ = [
     "header_text",
     "is_control_token_char",
     "parse_document",
+    "piece_debug_names",
     "recover_continuation_document",
     "token_debug_name",
     "velocity_to_bin",

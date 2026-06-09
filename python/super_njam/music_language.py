@@ -232,18 +232,23 @@ class NJamV4Language:
         return "bpe"
 
     def tokenizer_train_kwargs(self) -> Dict[str, object]:
+        from . import njam_v4
+
         return {
             "normalization_rule_name": "identity",
             "character_coverage": 1.0,
             "byte_fallback": False,
             "split_by_whitespace": False,
             "user_defined_symbols": ["\n"],
+            "max_sentencepiece_length": 32,
+            "add_dummy_prefix": False,
+            "required_chars": "".join(njam_v4.base_token_chars(include_controls=True)),
         }
 
     def tokenizer_seed_texts(self) -> list[str]:
         from . import njam_v4
 
-        return [njam_v4.base_vocabulary_seed_text(include_controls=True)]
+        return njam_v4.base_vocabulary_seed_texts(include_controls=True)
 
     def loss_mask_token_ids(self, tokenizer) -> set[int]:
         from . import njam_v4

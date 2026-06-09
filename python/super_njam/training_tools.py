@@ -14,13 +14,13 @@ from dataclasses import dataclass, asdict
 import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-import random
 
 import lightning as L
 import sentencepiece as spm
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -30,8 +30,15 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 from .audio_tools import render_document_audio
+from .generation_tools import build_generation_logits_processor
 from .midi_tools import write_midi
 from .music_language import get_language
+from .musical_eval import (
+    DEFAULT_MAX_NEW_TOKENS as DEFAULT_MUSICAL_EVAL_MAX_NEW_TOKENS,
+    log_musical_eval_to_tensorboard,
+    run_musical_eval,
+    write_musical_eval_json,
+)
 from .njam_v3 import (
     ControlChangeEvent,
     NJamDocument,
@@ -456,6 +463,206 @@ class SoloSlidingWindowDatasetPartial(Dataset):
             self.advance_epoch()
 
 
+def _parse_signature_ticks(metadata: Dict[str, str]) -> tuple[int, int, int]:
+    ppq = int(metadata.get("ppq", "96"))
+    sig = str(metadata.get("sig", "4/4"))
+    try:
+        numerator_raw, denominator_raw = sig.split("/", 1)
+        numerator = max(1, int(numerator_raw))
+        denominator = max(1, int(denominator_raw))
+    except Exception:
+        numerator, denominator = 4, 4
+    bar_ticks = max(1, int(round(ppq * numerator * (4.0 / denominator))))
+    return ppq, numerator, bar_ticks
+
+
+def _rebased_event(event, start_time: int):
+    payload = {**event.__dict__, "time": max(0, int(event.time) - int(start_time))}
+    return event.__class__(**payload)
+
+
+def _event_is_note(event) -> bool:
+    return isinstance(event, NoteEvent)
+
+
+def _tokenize_musical_window(
+    document: NJamDocument,
+    language,
+    tokenizer: SentencePieceTokenizerAdapter,
+) -> List[int]:
+    text = language.encode_document(document)
+    body = language.body_text(text)
+    return [tokenizer.bos_token_id] + tokenizer.encode(body, add_special_tokens=False) + [tokenizer.eos_token_id]
+
+
+class SoloMusicalWindowDatasetPartial(Dataset):
+    """Partial dataset over musically aligned bar windows.
+
+    Each dataset item is one normal next-token sample. A batch contains multiple
+    candidate windows from one source text, and an epoch yields one batch per
+    retained source text.
+    """
+
+    def __init__(
+        self,
+        texts: Sequence[str],
+        tokenizer: SentencePieceTokenizerAdapter,
+        seq_len: int,
+        batch_size: int,
+        split_name: str = "dataset",
+        randomize_each_epoch: bool = False,
+        language: str = "njam-v3",
+        musical_window_bars: int = 4,
+        musical_window_hop_bars: int = 1,
+        min_window_notes: int = 8,
+    ):
+        assert batch_size >= 1, "SoloMusicalWindowDatasetPartial requires batch_size >= 1."
+        assert musical_window_bars >= 1, "musical_window_bars must be at least 1."
+        assert musical_window_hop_bars >= 1, "musical_window_hop_bars must be at least 1."
+        assert min_window_notes >= 1, "min_window_notes must be at least 1."
+        self.seq_len = int(seq_len)
+        self.batch_size = int(batch_size)
+        self.pad_token_id = tokenizer.eos_token_id
+        self.loss_mask_token_ids = set(getattr(tokenizer, "loss_mask_token_ids", set()))
+        self.randomize_each_epoch = randomize_each_epoch
+        self.language = get_language(language)
+        self.musical_window_bars = int(musical_window_bars)
+        self.musical_window_hop_bars = int(musical_window_hop_bars)
+        self.min_window_notes = int(min_window_notes)
+        self.solo_token_ids: List[List[List[int]]] = []
+        self.window_counts_per_solo: List[int] = []
+        self.build_stats: Dict[str, int | str] = {
+            "mode": split_name,
+            "input_texts": len(texts),
+            "retained_texts": 0,
+            "excluded_texts": 0,
+            "candidate_windows": 0,
+            "sparse_windows_skipped": 0,
+            "overlength_windows_skipped": 0,
+            "parse_failures": 0,
+            "fallback_windows": 0,
+        }
+        for text in texts:
+            try:
+                candidates = self._build_candidates_for_text(str(text), tokenizer)
+            except Exception:
+                self.build_stats["parse_failures"] = int(self.build_stats["parse_failures"]) + 1
+                candidates = []
+            if candidates:
+                self.solo_token_ids.append(candidates)
+                self.window_counts_per_solo.append(len(candidates))
+                self.build_stats["retained_texts"] = int(self.build_stats["retained_texts"]) + 1
+                self.build_stats["candidate_windows"] = int(self.build_stats["candidate_windows"]) + len(candidates)
+            else:
+                self.build_stats["excluded_texts"] = int(self.build_stats["excluded_texts"]) + 1
+        assert self.solo_token_ids, (
+            f"{split_name} musical-window dataset produced zero usable solos. "
+            "Try lowering --min-window-notes or increasing --seq-len."
+        )
+        self.window_cursors = [0 for _ in self.window_counts_per_solo]
+
+    def _subdocument_for_window(
+        self,
+        document: NJamDocument,
+        start_time: int,
+        end_time: int,
+        min_notes: int,
+    ) -> NJamDocument | None:
+        events = [
+            _rebased_event(event, start_time)
+            for event in document.sorted_events()
+            if int(start_time) <= int(event.time) < int(end_time)
+        ]
+        if sum(1 for event in events if _event_is_note(event)) < min_notes:
+            return None
+        metadata = {key: value for key, value in document.metadata.items() if not str(key).startswith("_")}
+        return NJamDocument(metadata=metadata, events=events)
+
+    def _candidate_fallback(self, document: NJamDocument, tokenizer: SentencePieceTokenizerAdapter) -> List[int] | None:
+        notes = [event for event in document.sorted_events() if _event_is_note(event)]
+        if not notes:
+            return None
+        _, _, bar_ticks = _parse_signature_ticks(document.metadata)
+        window_ticks = max(1, self.musical_window_bars * bar_ticks)
+        best: List[int] | None = None
+        for note in notes:
+            subdoc = self._subdocument_for_window(document, int(note.time), int(note.time) + window_ticks, min_notes=1)
+            if subdoc is None:
+                continue
+            token_ids = _tokenize_musical_window(subdoc, self.language, tokenizer)
+            if len(token_ids) <= self.seq_len + 1 and (best is None or len(token_ids) < len(best)):
+                best = token_ids
+        if best is not None:
+            self.build_stats["fallback_windows"] = int(self.build_stats["fallback_windows"]) + 1
+        return best
+
+    def _build_candidates_for_text(self, text: str, tokenizer: SentencePieceTokenizerAdapter) -> List[List[int]]:
+        document = self.language.parse_document(text)
+        sorted_events = document.sorted_events()
+        if not sorted_events:
+            return []
+        _, _, bar_ticks = _parse_signature_ticks(document.metadata)
+        window_ticks = max(1, self.musical_window_bars * bar_ticks)
+        hop_ticks = max(1, self.musical_window_hop_bars * bar_ticks)
+        max_time = max(int(event.time) for event in sorted_events)
+        candidates: List[List[int]] = []
+        for start_time in range(0, max_time + 1, hop_ticks):
+            subdoc = self._subdocument_for_window(
+                document,
+                start_time,
+                start_time + window_ticks,
+                min_notes=self.min_window_notes,
+            )
+            if subdoc is None:
+                self.build_stats["sparse_windows_skipped"] = int(self.build_stats["sparse_windows_skipped"]) + 1
+                continue
+            token_ids = _tokenize_musical_window(subdoc, self.language, tokenizer)
+            if len(token_ids) > self.seq_len + 1:
+                self.build_stats["overlength_windows_skipped"] = int(self.build_stats["overlength_windows_skipped"]) + 1
+                continue
+            candidates.append(token_ids)
+        if not candidates:
+            fallback = self._candidate_fallback(document, tokenizer)
+            if fallback is not None:
+                candidates.append(fallback)
+        return candidates
+
+    def __len__(self) -> int:
+        return len(self.solo_token_ids) * self.batch_size
+
+    def resolve_window_index(self, idx: int) -> Tuple[int, int]:
+        solo_idx = idx // self.batch_size
+        offset = idx % self.batch_size
+        window_count = self.window_counts_per_solo[solo_idx]
+        return solo_idx, (self.window_cursors[solo_idx] + offset) % window_count
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        solo_idx, candidate_idx = self.resolve_window_index(idx)
+        token_ids = self.solo_token_ids[solo_idx][candidate_idx]
+        return _window_sample(
+            token_ids,
+            len(token_ids) - 2,
+            self.seq_len,
+            self.pad_token_id,
+            self.loss_mask_token_ids,
+        )
+
+    def advance_epoch(self) -> None:
+        for solo_idx, window_count in enumerate(self.window_counts_per_solo):
+            self.window_cursors[solo_idx] = (self.window_cursors[solo_idx] + self.batch_size) % window_count
+
+    def reset_cursors(self) -> None:
+        self.window_cursors = [0 for _ in self.window_counts_per_solo]
+
+    def prepare_validation_epoch(self) -> None:
+        if self.randomize_each_epoch:
+            self.window_cursors = [random.randrange(window_count) for window_count in self.window_counts_per_solo]
+
+    def finish_validation_epoch(self) -> None:
+        if not self.randomize_each_epoch:
+            self.advance_epoch()
+
+
 @dataclass
 class TrainConfig:
     corpus_path: Path
@@ -481,6 +688,18 @@ class TrainConfig:
     dataset_mode: str = "partial"
     validation_dataset_mode: str = "partial-random"
     language: str = "njam-v3"
+    musical_eval: bool = True
+    musical_eval_every_n_epochs: int = 1
+    musical_eval_max_new_tokens: int = DEFAULT_MUSICAL_EVAL_MAX_NEW_TOKENS
+    grammar_constrained_generation: bool = True
+    musical_window_bars: int = 4
+    musical_window_hop_bars: int = 1
+    min_window_notes: int = 8
+    gradient_accumulation_steps: int = 16
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    warmup_steps: int = 2000
+    lr_scheduler: str = "cosine"
 
 
 class NJamLightningModule(L.LightningModule):
@@ -516,6 +735,9 @@ class NJamLightningModule(L.LightningModule):
         return self.cfg.output_dir / f"{self._sample_prefix(epoch, sample_idx)}.{label}.{suffix}"
 
     def _build_prompt(self, text: str) -> str:
+        if self.cfg.language == "njam-v4":
+            keep = max(8, int(len(text) * self.cfg.sample_prompt_ratio))
+            return text[:keep]
         tokens = text.split()
         return " ".join(tokens[: max(8, int(len(tokens) * self.cfg.sample_prompt_ratio))])
 
@@ -524,6 +746,12 @@ class NJamLightningModule(L.LightningModule):
         max_prompt_tokens = max(1, max_positions - reserved_new_tokens - 1)
         if len(self.tokenizer.encode(prompt, add_special_tokens=False)) <= max_prompt_tokens:
             return prompt
+        if self.cfg.language == "njam-v4":
+            for start_idx in range(len(prompt)):
+                candidate = prompt[start_idx:].strip()
+                if candidate and len(self.tokenizer.encode(candidate, add_special_tokens=False)) <= max_prompt_tokens:
+                    return candidate
+            return prompt[-1:] if prompt else prompt
         body_tokens = prompt.split()
         for start_idx in range(len(body_tokens)):
             candidate = " ".join(body_tokens[start_idx:]).strip()
@@ -548,6 +776,11 @@ class NJamLightningModule(L.LightningModule):
                 do_sample=True,
                 temperature=0.9,
                 top_k=16,
+                logits_processor=build_generation_logits_processor(
+                    self.tokenizer,
+                    self.language.name,
+                    enabled=self.cfg.grammar_constrained_generation,
+                ),
             )
         full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
         continuation_ids = generated[0][input_length:]
@@ -651,6 +884,27 @@ class NJamLightningModule(L.LightningModule):
     def _write_sample_summary(self, sample_idx: int, payload: Dict[str, object]) -> None:
         summary_path = self._artifact_path(self.current_epoch, sample_idx, "summary", "json")
         summary_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+
+    def _run_musical_eval(self) -> None:
+        if not self.cfg.musical_eval:
+            return
+        assert self.cfg.musical_eval_every_n_epochs >= 1, "musical_eval_every_n_epochs must be at least 1."
+        if self.current_epoch % self.cfg.musical_eval_every_n_epochs != 0:
+            return
+        result = run_musical_eval(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            language=self.language,
+            max_new_tokens=self.cfg.musical_eval_max_new_tokens,
+            device=self.device,
+            grammar_constrained_generation=self.cfg.grammar_constrained_generation,
+        )
+        logger = self.logger.experiment if self.logger else None
+        log_musical_eval_to_tensorboard(result, logger, int(self.current_epoch))
+        write_musical_eval_json(
+            result,
+            self.cfg.output_dir / f"musical_eval_epoch_{int(self.current_epoch):04d}.json",
+        )
 
     def _remove_render_bundle(self, paths: Dict[str, str]) -> None:
         for path_str in paths.values():
@@ -812,20 +1066,48 @@ class NJamLightningModule(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         try:
-            if not self.val_samples:
-                return
-            if self.cfg.sample_every_n_items is not None:
-                return
-            assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
-            if self.current_epoch % self.cfg.sample_every_n_epochs != 0:
-                return
-            for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
-                self._render_validation_sample(idx, sample)
+            self._run_musical_eval()
+            if self.val_samples and self.cfg.sample_every_n_items is None:
+                assert self.cfg.sample_every_n_epochs >= 1, "sample_every_n_epochs must be at least 1."
+                if self.current_epoch % self.cfg.sample_every_n_epochs == 0:
+                    for idx, sample in enumerate(self.val_samples[: self.cfg.sample_limit]):
+                        self._render_validation_sample(idx, sample)
         finally:
             self._finish_validation_dataset_epoch()
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.cfg.learning_rate)
+        assert self.cfg.lr_scheduler in {"constant", "linear", "cosine"}, "Unsupported lr_scheduler."
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.cfg.learning_rate,
+            weight_decay=max(0.0, float(self.cfg.weight_decay)),
+        )
+        if self.cfg.lr_scheduler == "constant" and self.cfg.warmup_steps <= 0:
+            return optimizer
+
+        warmup_steps = max(0, int(self.cfg.warmup_steps))
+        total_steps = max(1, int(getattr(self.trainer, "estimated_stepping_batches", 1) or 1))
+
+        def lr_lambda(step: int) -> float:
+            step = int(step)
+            if warmup_steps > 0 and step < warmup_steps:
+                return max(1e-8, step / max(1, warmup_steps))
+            if self.cfg.lr_scheduler == "constant":
+                return 1.0
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            if self.cfg.lr_scheduler == "linear":
+                return max(0.0, 1.0 - progress)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": LambdaLR(optimizer, lr_lambda=lr_lambda),
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
 
 def _read_wav_mono(path: Path) -> List[float]:
@@ -890,6 +1172,9 @@ def build_sliding_window_dataset(
     mode: str,
     prep_workers: Optional[int],
     language: str,
+    musical_window_bars: int = 4,
+    musical_window_hop_bars: int = 1,
+    min_window_notes: int = 8,
 ):
     if mode == "full":
         return SoloSlidingWindowDataset(
@@ -911,11 +1196,24 @@ def build_sliding_window_dataset(
             randomize_each_epoch=mode == "partial-random",
             language=language,
         )
+    if mode in {"musical-partial", "musical-partial-random"}:
+        return SoloMusicalWindowDatasetPartial(
+            texts,
+            tokenizer,
+            seq_len,
+            batch_size=batch_size,
+            split_name=split_name,
+            randomize_each_epoch=mode == "musical-partial-random",
+            language=language,
+            musical_window_bars=musical_window_bars,
+            musical_window_hop_bars=musical_window_hop_bars,
+            min_window_notes=min_window_notes,
+        )
     raise AssertionError(f"Unsupported sliding-window dataset mode: {mode!r}")
 
 
 def dataset_dataloader_kwargs(dataset) -> Dict[str, object]:
-    if isinstance(dataset, SoloSlidingWindowDatasetPartial):
+    if isinstance(dataset, (SoloSlidingWindowDatasetPartial, SoloMusicalWindowDatasetPartial)):
         return partial_dataloader_kwargs()
     return dataloader_kwargs()
 
@@ -925,12 +1223,23 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
     configure_torch_runtime()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     language = get_language(config.language)
-    assert config.dataset_mode in {"partial", "full"}, "dataset_mode must be one of: partial, full."
+    assert config.dataset_mode in {
+        "partial",
+        "full",
+        "musical-partial",
+    }, "dataset_mode must be one of: partial, full, musical-partial."
     assert config.validation_dataset_mode in {
         "partial-random",
         "partial",
         "full",
-    }, "validation_dataset_mode must be one of: partial-random, partial, full."
+        "musical-partial",
+        "musical-partial-random",
+    }, "validation_dataset_mode must be one of: partial-random, partial, full, musical-partial, musical-partial-random."
+    assert config.gradient_accumulation_steps >= 1, "gradient_accumulation_steps must be at least 1."
+    assert config.max_grad_norm >= 0, "max_grad_norm must be non-negative."
+    assert config.weight_decay >= 0, "weight_decay must be non-negative."
+    assert config.warmup_steps >= 0, "warmup_steps must be non-negative."
+    assert config.lr_scheduler in {"constant", "linear", "cosine"}, "lr_scheduler must be one of: constant, linear, cosine."
     records = load_corpus_records(config.corpus_path)
     splits = split_records_by_solo(records)
     tokenizer_dir = config.output_dir / "tokenizer"
@@ -957,6 +1266,9 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         mode=config.dataset_mode,
         prep_workers=config.dataset_prep_workers,
         language=language.name,
+        musical_window_bars=config.musical_window_bars,
+        musical_window_hop_bars=config.musical_window_hop_bars,
+        min_window_notes=config.min_window_notes,
     )
     val_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["val"]],
@@ -967,6 +1279,9 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
         language=language.name,
+        musical_window_bars=config.musical_window_bars,
+        musical_window_hop_bars=config.musical_window_hop_bars,
+        min_window_notes=config.min_window_notes,
     )
     test_ds = build_sliding_window_dataset(
         [str(r["text"]) for r in splits["test"]],
@@ -977,6 +1292,9 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         mode=config.validation_dataset_mode,
         prep_workers=config.dataset_prep_workers,
         language=language.name,
+        musical_window_bars=config.musical_window_bars,
+        musical_window_hop_bars=config.musical_window_hop_bars,
+        min_window_notes=config.min_window_notes,
     )
 
     model_cfg = LlamaConfig(
@@ -1015,7 +1333,7 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         return DataLoader(
             train_ds,
             batch_size=config.batch_size,
-            shuffle=not isinstance(train_ds, SoloSlidingWindowDatasetPartial),
+            shuffle=not isinstance(train_ds, (SoloSlidingWindowDatasetPartial, SoloMusicalWindowDatasetPartial)),
             **dataset_dataloader_kwargs(train_ds),
         )
 
@@ -1039,6 +1357,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
             callbacks=[],
             enable_checkpointing=False,
             log_every_n_steps=1,
+            accumulate_grad_batches=config.gradient_accumulation_steps,
+            gradient_clip_val=float(config.max_grad_norm),
             **accelerator_kwargs,
         )
         preflight_trainer.fit(module, make_train_loader(), make_val_loader())
@@ -1055,6 +1375,8 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         callbacks=[checkpoint, early_stop],
         enable_checkpointing=True,
         log_every_n_steps=1,
+        accumulate_grad_batches=config.gradient_accumulation_steps,
+        gradient_clip_val=float(config.max_grad_norm),
         **trainer_kwargs,
         **accelerator_kwargs,
     )
@@ -1080,6 +1402,9 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         "mean_train_windows_per_solo": (sum(train_ds.window_counts_per_solo) / len(train_ds.window_counts_per_solo)),
         "mean_val_windows_per_solo": (sum(val_ds.window_counts_per_solo) / len(val_ds.window_counts_per_solo)),
         "mean_test_windows_per_solo": (sum(test_ds.window_counts_per_solo) / len(test_ds.window_counts_per_solo)),
+        "train_dataset_build_stats": getattr(train_ds, "build_stats", None),
+        "val_dataset_build_stats": getattr(val_ds, "build_stats", None),
+        "test_dataset_build_stats": getattr(test_ds, "build_stats", None),
         "window_stride": 1,
         "header_tokens_dropped": True,
         "left_padding": True,
@@ -1096,6 +1421,18 @@ def run_training(config: TrainConfig) -> Dict[str, object]:
         "tokenizer_dir": str(config.output_dir / "tokenizer"),
         "tokenizer_model_type": tokenizer_model_type,
         "loss_mask_token_ids": sorted(int(token_id) for token_id in tokenizer.loss_mask_token_ids),
+        "musical_eval": config.musical_eval,
+        "musical_eval_every_n_epochs": config.musical_eval_every_n_epochs,
+        "musical_eval_max_new_tokens": config.musical_eval_max_new_tokens,
+        "grammar_constrained_generation": config.grammar_constrained_generation,
+        "musical_window_bars": config.musical_window_bars,
+        "musical_window_hop_bars": config.musical_window_hop_bars,
+        "min_window_notes": config.min_window_notes,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "weight_decay": config.weight_decay,
+        "max_grad_norm": config.max_grad_norm,
+        "warmup_steps": config.warmup_steps,
+        "lr_scheduler": config.lr_scheduler,
         "config": asdict(config),
     }
     (config.output_dir / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")

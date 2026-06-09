@@ -6,9 +6,13 @@ from unittest import mock
 from torch.utils.data import DataLoader
 from transformers import LlamaConfig, LlamaForCausalLM
 
+from super_njam import njam_v4
+from super_njam.music_language import get_language
+from super_njam.njam_v3 import NJamDocument, NoteEvent
 from super_njam.training_tools import (
     NJamLightningModule,
     SentencePieceTokenizerAdapter,
+    SoloMusicalWindowDatasetPartial,
     SoloSlidingWindowDataset,
     SoloSlidingWindowDatasetPartial,
     TrainConfig,
@@ -24,6 +28,18 @@ class SlidingWindowDatasetTests(unittest.TestCase):
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
         return build_sentencepiece_tokenizer(texts, Path(tmpdir.name), vocab_size=512)
+
+    def _build_v4_tokenizer(self, texts):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        language = get_language("njam-v4")
+        return build_sentencepiece_tokenizer(
+            texts + language.tokenizer_seed_texts(),
+            Path(tmpdir.name),
+            vocab_size=1024,
+            model_type=language.tokenizer_model_type(),
+            trainer_kwargs=language.tokenizer_train_kwargs(),
+        )
 
     def test_header_tokens_are_excluded_from_training_body(self) -> None:
         text = "NV3|ppq=96|tempo=120|sig=4/4\nT0 N1Y,3C,11 T1 C1,2O\n"
@@ -140,6 +156,61 @@ class SlidingWindowDatasetTests(unittest.TestCase):
         with mock.patch("super_njam.training_tools.random.randrange", side_effect=[1, 2]):
             dataset.prepare_validation_epoch()
         self.assertEqual(dataset.window_cursors, [1, 2])
+
+    def test_musical_partial_dataset_uses_bar_windows_and_single_samples(self) -> None:
+        language = get_language("njam-v4")
+        document = NJamDocument(
+            metadata={"ppq": "96", "tempo": "120.000", "sig": "4/4"},
+            events=[
+                NoteEvent(time=idx * 48, pitch=60 + (idx % 7), velocity=90, duration=24)
+                for idx in range(24)
+            ],
+        )
+        text = language.encode_document(document)
+        tokenizer = self._build_v4_tokenizer([language.body_text(text)])
+        dataset = SoloMusicalWindowDatasetPartial(
+            [text],
+            tokenizer,
+            seq_len=128,
+            batch_size=3,
+            language="njam-v4",
+            musical_window_bars=1,
+            musical_window_hop_bars=1,
+            min_window_notes=2,
+        )
+        self.assertEqual(len(dataset), 3)
+        self.assertGreaterEqual(dataset.window_counts_per_solo[0], 2)
+        sample = dataset[0]
+        self.assertEqual(tuple(sample["input_ids"].shape), (128,))
+        self.assertEqual(tuple(sample["attention_mask"].shape), (128,))
+        self.assertEqual(tuple(sample["labels"].shape), (128,))
+        decoded = tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
+        parsed = njam_v4.recover_continuation_document(decoded, metadata={"ppq": "96", "sig": "4/4"})
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertTrue(all(event.time < 96 * 4 for event in parsed.events))
+
+    def test_musical_partial_dataset_filters_sparse_windows_and_falls_back(self) -> None:
+        language = get_language("njam-v4")
+        document = NJamDocument(
+            metadata={"ppq": "96", "tempo": "120.000", "sig": "4/4"},
+            events=[NoteEvent(time=0, pitch=60, velocity=90, duration=24)],
+        )
+        text = language.encode_document(document)
+        tokenizer = self._build_v4_tokenizer([language.body_text(text)])
+        dataset = SoloMusicalWindowDatasetPartial(
+            [text],
+            tokenizer,
+            seq_len=128,
+            batch_size=2,
+            language="njam-v4",
+            musical_window_bars=1,
+            musical_window_hop_bars=1,
+            min_window_notes=8,
+        )
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(dataset.build_stats["fallback_windows"], 1)
+        self.assertGreaterEqual(dataset.build_stats["sparse_windows_skipped"], 1)
 
     def test_prompt_truncation_keeps_nonempty_njam_tokens(self) -> None:
         text = (

@@ -158,15 +158,87 @@ def main() -> None:
     )
     parser.add_argument(
         "--dataset-mode",
-        choices=["partial", "full"],
+        choices=["partial", "full", "musical-partial"],
         default="partial",
-        help="Training dataset epoch mode. partial gives one batch per solo per epoch; full preserves exhaustive sliding-window epochs.",
+        help="Training dataset epoch mode. partial gives one batch per solo per epoch; full preserves exhaustive sliding-window epochs; musical-partial uses bar-aligned filtered windows.",
     )
     parser.add_argument(
         "--validation-dataset-mode",
-        choices=["partial-random", "partial", "full"],
+        choices=["partial-random", "partial", "full", "musical-partial", "musical-partial-random"],
         default="partial-random",
-        help="Validation dataset epoch mode. partial-random samples one random batch per solo each validation epoch; full validates every window.",
+        help="Validation dataset epoch mode. partial-random samples one random batch per solo each validation epoch; full validates every window; musical modes use bar-aligned filtered windows.",
+    )
+    parser.add_argument(
+        "--musical-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run lightweight synthetic musical evaluations at validation epoch end. Enabled by default; pass --no-musical-eval to skip.",
+    )
+    parser.add_argument(
+        "--musical-eval-every-n-epochs",
+        type=int,
+        default=1,
+        help="How often to run synthetic musical evaluations. Expected range: integers >= 1.",
+    )
+    parser.add_argument(
+        "--musical-eval-max-new-tokens",
+        type=int,
+        default=192,
+        help="Maximum generated continuation tokens for each synthetic musical evaluation prompt.",
+    )
+    parser.add_argument(
+        "--grammar-constrained-generation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply NJam-v4 grammar constraints during Python validation/sample generation. Enabled by default for v4.",
+    )
+    parser.add_argument(
+        "--musical-window-bars",
+        type=int,
+        default=4,
+        help="Number of bars per candidate in musical-partial dataset modes.",
+    )
+    parser.add_argument(
+        "--musical-window-hop-bars",
+        type=int,
+        default=1,
+        help="Hop size in bars between candidates in musical-partial dataset modes.",
+    )
+    parser.add_argument(
+        "--min-window-notes",
+        type=int,
+        default=8,
+        help="Minimum note count required for musical-partial candidate windows.",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=16,
+        help="Number of batches to accumulate before each optimizer step. Use 1 for old behavior.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay. Use 0 for old behavior.",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Lightning gradient clipping norm. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2000,
+        help="Step-based learning-rate warmup. Use 0 for no warmup.",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["constant", "linear", "cosine"],
+        default="cosine",
+        help="Step-based learning-rate scheduler after warmup.",
     )
     args = parser.parse_args()
     output_dir = args.output_dir if args.output_dir is not None else _default_output_dir(args)
@@ -194,6 +266,18 @@ def main() -> None:
         dataset_mode=args.dataset_mode,
         validation_dataset_mode=args.validation_dataset_mode,
         language=args.language,
+        musical_eval=args.musical_eval,
+        musical_eval_every_n_epochs=args.musical_eval_every_n_epochs,
+        musical_eval_max_new_tokens=args.musical_eval_max_new_tokens,
+        grammar_constrained_generation=args.grammar_constrained_generation,
+        musical_window_bars=args.musical_window_bars,
+        musical_window_hop_bars=args.musical_window_hop_bars,
+        min_window_notes=args.min_window_notes,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        warmup_steps=args.warmup_steps,
+        lr_scheduler=args.lr_scheduler,
     )
     summary = run_training(config)
     summary["resolved_output_dir"] = str(output_dir)
