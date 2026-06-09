@@ -7,7 +7,11 @@ import json
 from pathlib import Path
 import re
 from typing import Dict, Iterable, List, Optional, Sequence
-import tqdm 
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 import torch
 
@@ -318,6 +322,64 @@ def _generate_continuation(
     return tokenizer.decode(continuation_ids, skip_special_tokens=True), int(input_ids.shape[1]), int(len(continuation_ids))
 
 
+def _generate_continuations_batch(
+    model,
+    tokenizer,
+    language: MusicLanguage,
+    prompt_texts: Sequence[str],
+    max_new_tokens: int,
+    device: torch.device,
+    grammar_constrained_generation: bool = True,
+) -> List[tuple[str, int, int]]:
+    if not prompt_texts:
+        return []
+    max_positions = int(model.config.max_position_embeddings)
+    prompt_id_lists = [
+        _truncate_prompt_ids(
+            tokenizer,
+            tokenizer.encode(prompt_text, add_special_tokens=False),
+            max_positions=max_positions,
+            max_new_tokens=max_new_tokens,
+        )
+        for prompt_text in prompt_texts
+    ]
+    max_prompt_len = max(1, max(len(ids) for ids in prompt_id_lists))
+    available_new_tokens = max(1, min(max_new_tokens, max_positions - max_prompt_len - 1))
+    padded_rows = []
+    attention_rows = []
+    for ids in prompt_id_lists:
+        left_pad = max_prompt_len - len(ids)
+        padded_rows.append(([tokenizer.pad_token_id] * left_pad) + ids)
+        attention_rows.append(([0] * left_pad) + ([1] * len(ids)))
+    input_ids = torch.tensor(padded_rows, dtype=torch.long, device=device)
+    attention_mask = torch.tensor(attention_rows, dtype=torch.long, device=device)
+    with torch.no_grad():
+        generated = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=available_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            logits_processor=build_generation_logits_processor(
+                tokenizer,
+                language.name,
+                enabled=grammar_constrained_generation,
+            ),
+        )
+    results = []
+    for row_idx in range(int(generated.shape[0])):
+        continuation_ids = generated[row_idx][max_prompt_len:]
+        results.append(
+            (
+                tokenizer.decode(continuation_ids, skip_special_tokens=True),
+                int(len(prompt_id_lists[row_idx])),
+                int(len(continuation_ids)),
+            )
+        )
+    return results
+
+
 def _sanitize_tag(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_./-]+", "_", value)
 
@@ -339,73 +401,83 @@ def run_musical_eval(
     device = device or next(model.parameters()).device
     cases = get_eval_cases(suite)
     results: List[MusicalEvalCaseResult] = []
-    with tqdm.tqdm(total=len(cases), desc='music test') as pbar:
-        for case in cases:
-            pbar.update(1)
-            prompt_text = prepare_eval_prompt_text(language, case.document)
-            error = None
-            continuation_text = ""
-            prompt_token_count = 0
-            generated_token_count = 0
-            recovered_doc = None
-            recovery_stats = {"recovery_rate": 0.0, "quality_score": 0.0, "events_recovered": 0}
-            try:
-                continuation_text, prompt_token_count, generated_token_count = _generate_continuation(
-                    model,
-                    tokenizer,
-                    language,
-                    prompt_text,
-                    max_new_tokens=max_new_tokens,
-                    device=device,
-                    grammar_constrained_generation=grammar_constrained_generation,
-                )
-                recovery_stats = language.analyze_parseable_continuation(continuation_text).to_dict()
-                recovered_doc = language.recover_continuation_document(
-                    continuation_text,
-                    metadata=dict(case.document.metadata),
-                )
-            except Exception as exc:
-                error = str(exc)
-            notes = _notes(recovered_doc)
-            note_patterns = note_pattern_metrics(continuation_text, language.name)
-            enough_notes = len(notes) >= min_notes
-            ppq = int(case.document.metadata.get("ppq", DEFAULT_PPQ))
-            scale_adherence, prompt_pitch_coverage, out_of_scale_rate = _pitch_metrics(case, notes, enough_notes)
-            rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity = _rhythm_metrics(case, notes, ppq, enough_notes)
-            category_scores = []
-            if case.category == "harmony":
-                category_scores.extend([scale_adherence, prompt_pitch_coverage])
-            if case.category == "rhythm":
-                category_scores.extend([rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity])
-            overall = sum(category_scores) / len(category_scores) if category_scores else 0.0
-            recovered_events = int(recovery_stats.get("events_recovered", 0))
-            parseable_note_rate = len(notes) / max(1, recovered_events)
-            results.append(
-                MusicalEvalCaseResult(
-                    name=case.name,
-                    category=case.category,
-                    prompt_token_count=prompt_token_count,
-                    generated_token_count=generated_token_count,
-                    recovered_event_count=recovered_events,
-                    recovered_note_count=len(notes),
-                    parseable_note_rate=parseable_note_rate,
-                    note_marker_count=int(note_patterns["note_marker_count"]),
-                    complete_note_pattern_count=int(note_patterns["complete_note_pattern_count"]),
-                    complete_note_pattern_rate=float(note_patterns["complete_note_pattern_rate"]),
-                    recovery_rate=float(recovery_stats.get("recovery_rate", 0.0)),
-                    recovery_quality_score=float(recovery_stats.get("quality_score", 0.0)),
-                    scale_adherence=scale_adherence,
-                    prompt_pitch_coverage=prompt_pitch_coverage,
-                    out_of_scale_rate=out_of_scale_rate,
-                    rhythm_ioi_similarity=rhythm_ioi_similarity,
-                    rhythm_alignment=rhythm_alignment,
-                    rhythm_bar_phase_similarity=rhythm_bar_phase_similarity,
-                    overall=overall,
-                    generated_preview=continuation_text[:240],
-                    error=error,
-                )
+    prompt_texts = [prepare_eval_prompt_text(language, case.document) for case in cases]
+    generated_batches: List[tuple[str, int, int] | None] = [None for _ in cases]
+    batch_error: Optional[str] = None
+    try:
+        batch_outputs = _generate_continuations_batch(
+            model,
+            tokenizer,
+            language,
+            prompt_texts,
+            max_new_tokens=max_new_tokens,
+            device=device,
+            grammar_constrained_generation=grammar_constrained_generation,
+        )
+        generated_batches = list(batch_outputs)
+    except Exception as exc:
+        batch_error = str(exc)
+
+    iterator = zip(cases, prompt_texts, generated_batches)
+    if tqdm is not None:
+        iterator = tqdm(list(iterator), desc="music test")
+    for case, prompt_text, generated_item in iterator:
+        error = None
+        continuation_text = ""
+        prompt_token_count = 0
+        generated_token_count = 0
+        recovered_doc = None
+        recovery_stats = {"recovery_rate": 0.0, "quality_score": 0.0, "events_recovered": 0}
+        try:
+            if generated_item is None:
+                raise RuntimeError(batch_error or "Batched musical generation failed.")
+            continuation_text, prompt_token_count, generated_token_count = generated_item
+            recovery_stats = language.analyze_parseable_continuation(continuation_text).to_dict()
+            recovered_doc = language.recover_continuation_document(
+                continuation_text,
+                metadata=dict(case.document.metadata),
             )
-        ## end of iterate over cases in music eval suite
+        except Exception as exc:
+            error = str(exc)
+        notes = _notes(recovered_doc)
+        note_patterns = note_pattern_metrics(continuation_text, language.name)
+        enough_notes = len(notes) >= min_notes
+        ppq = int(case.document.metadata.get("ppq", DEFAULT_PPQ))
+        scale_adherence, prompt_pitch_coverage, out_of_scale_rate = _pitch_metrics(case, notes, enough_notes)
+        rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity = _rhythm_metrics(case, notes, ppq, enough_notes)
+        category_scores = []
+        if case.category == "harmony":
+            category_scores.extend([scale_adherence, prompt_pitch_coverage])
+        if case.category == "rhythm":
+            category_scores.extend([rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity])
+        overall = sum(category_scores) / len(category_scores) if category_scores else 0.0
+        recovered_events = int(recovery_stats.get("events_recovered", 0))
+        parseable_note_rate = len(notes) / max(1, recovered_events)
+        results.append(
+            MusicalEvalCaseResult(
+                name=case.name,
+                category=case.category,
+                prompt_token_count=prompt_token_count,
+                generated_token_count=generated_token_count,
+                recovered_event_count=recovered_events,
+                recovered_note_count=len(notes),
+                parseable_note_rate=parseable_note_rate,
+                note_marker_count=int(note_patterns["note_marker_count"]),
+                complete_note_pattern_count=int(note_patterns["complete_note_pattern_count"]),
+                complete_note_pattern_rate=float(note_patterns["complete_note_pattern_rate"]),
+                recovery_rate=float(recovery_stats.get("recovery_rate", 0.0)),
+                recovery_quality_score=float(recovery_stats.get("quality_score", 0.0)),
+                scale_adherence=scale_adherence,
+                prompt_pitch_coverage=prompt_pitch_coverage,
+                out_of_scale_rate=out_of_scale_rate,
+                rhythm_ioi_similarity=rhythm_ioi_similarity,
+                rhythm_alignment=rhythm_alignment,
+                rhythm_bar_phase_similarity=rhythm_bar_phase_similarity,
+                overall=overall,
+                generated_preview=continuation_text[:240],
+                error=error,
+            )
+        )
     if model_was_training:
         model.train()
     return MusicalEvalRunResult(

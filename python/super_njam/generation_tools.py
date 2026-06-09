@@ -21,6 +21,17 @@ CC_NUMBER = "cc_number"
 CC_VALUE = "cc_value"
 BEND_VALUE = "bend_value"
 PROGRAM_VALUE = "program_value"
+GRAMMAR_STATES = (
+    FREE,
+    NOTE_PITCH,
+    NOTE_VELOCITY,
+    NOTE_DURATION,
+    NOTE_DURATION_TAIL,
+    CC_NUMBER,
+    CC_VALUE,
+    BEND_VALUE,
+    PROGRAM_VALUE,
+)
 
 
 def _base_token_ids(text: str) -> List[int]:
@@ -151,13 +162,28 @@ class NJamV4GrammarLogitsProcessor(LogitsProcessor):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.piece_infos = njam_v4_piece_infos(tokenizer)
+        self.base_token_ids_by_token_id = [info.base_token_ids for info in self.piece_infos]
         self.eos_token_id = int(getattr(tokenizer, "eos_token_id", -1))
+        self._allowed_mask_cache: dict[tuple[str, str, int], torch.Tensor] = {}
 
-    def _state_for_input_ids(self, input_ids: torch.Tensor) -> str:
-        text = self.tokenizer.decode(input_ids.detach().cpu().tolist(), skip_special_tokens=True)
-        return njam_v4_grammar_state_for_text(text)
+    def _state_for_token_ids(self, token_ids: Sequence[int]) -> str:
+        state = FREE
+        for token_id in token_ids:
+            if token_id < 0 or token_id >= len(self.base_token_ids_by_token_id):
+                continue
+            for base_token_id in self.base_token_ids_by_token_id[int(token_id)]:
+                next_state = advance_njam_v4_grammar_state(state, base_token_id)
+                if next_state is None:
+                    state = FREE
+                else:
+                    state = next_state
+        return state
 
     def _allowed_mask(self, state: str, device: torch.device, vocab_size: int) -> torch.Tensor:
+        cache_key = (state, str(device), int(vocab_size))
+        cached = self._allowed_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
         allowed = torch.zeros(vocab_size, dtype=torch.bool, device=device)
         for info in self.piece_infos[:vocab_size]:
             if info.token_id == self.eos_token_id:
@@ -167,16 +193,17 @@ class NJamV4GrammarLogitsProcessor(LogitsProcessor):
                 allowed[info.token_id] = True
         if not bool(allowed.any()):
             allowed[:] = True
+        self._allowed_mask_cache[cache_key] = allowed
         return allowed
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        masked = scores.clone()
         vocab_size = int(scores.shape[-1])
+        row_masks = []
         for row_idx in range(int(input_ids.shape[0])):
-            state = self._state_for_input_ids(input_ids[row_idx])
-            allowed = self._allowed_mask(state, scores.device, vocab_size)
-            masked[row_idx, ~allowed] = -float("inf")
-        return masked
+            state = self._state_for_token_ids(input_ids[row_idx].detach().cpu().tolist())
+            row_masks.append(self._allowed_mask(state, scores.device, vocab_size))
+        allowed = torch.stack(row_masks, dim=0)
+        return scores.masked_fill(~allowed, -float("inf"))
 
 
 def build_generation_logits_processor(tokenizer, language_name: str, enabled: bool = True):
