@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 from typing import Dict, Iterable, List, Optional, Sequence
+import tqdm 
 
 import torch
 
@@ -338,70 +339,73 @@ def run_musical_eval(
     device = device or next(model.parameters()).device
     cases = get_eval_cases(suite)
     results: List[MusicalEvalCaseResult] = []
-    for case in cases:
-        prompt_text = prepare_eval_prompt_text(language, case.document)
-        error = None
-        continuation_text = ""
-        prompt_token_count = 0
-        generated_token_count = 0
-        recovered_doc = None
-        recovery_stats = {"recovery_rate": 0.0, "quality_score": 0.0, "events_recovered": 0}
-        try:
-            continuation_text, prompt_token_count, generated_token_count = _generate_continuation(
-                model,
-                tokenizer,
-                language,
-                prompt_text,
-                max_new_tokens=max_new_tokens,
-                device=device,
-                grammar_constrained_generation=grammar_constrained_generation,
+    with tqdm.tqdm(total=len(cases), desc='music test') as pbar:
+        for case in cases:
+            pbar.update(1)
+            prompt_text = prepare_eval_prompt_text(language, case.document)
+            error = None
+            continuation_text = ""
+            prompt_token_count = 0
+            generated_token_count = 0
+            recovered_doc = None
+            recovery_stats = {"recovery_rate": 0.0, "quality_score": 0.0, "events_recovered": 0}
+            try:
+                continuation_text, prompt_token_count, generated_token_count = _generate_continuation(
+                    model,
+                    tokenizer,
+                    language,
+                    prompt_text,
+                    max_new_tokens=max_new_tokens,
+                    device=device,
+                    grammar_constrained_generation=grammar_constrained_generation,
+                )
+                recovery_stats = language.analyze_parseable_continuation(continuation_text).to_dict()
+                recovered_doc = language.recover_continuation_document(
+                    continuation_text,
+                    metadata=dict(case.document.metadata),
+                )
+            except Exception as exc:
+                error = str(exc)
+            notes = _notes(recovered_doc)
+            note_patterns = note_pattern_metrics(continuation_text, language.name)
+            enough_notes = len(notes) >= min_notes
+            ppq = int(case.document.metadata.get("ppq", DEFAULT_PPQ))
+            scale_adherence, prompt_pitch_coverage, out_of_scale_rate = _pitch_metrics(case, notes, enough_notes)
+            rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity = _rhythm_metrics(case, notes, ppq, enough_notes)
+            category_scores = []
+            if case.category == "harmony":
+                category_scores.extend([scale_adherence, prompt_pitch_coverage])
+            if case.category == "rhythm":
+                category_scores.extend([rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity])
+            overall = sum(category_scores) / len(category_scores) if category_scores else 0.0
+            recovered_events = int(recovery_stats.get("events_recovered", 0))
+            parseable_note_rate = len(notes) / max(1, recovered_events)
+            results.append(
+                MusicalEvalCaseResult(
+                    name=case.name,
+                    category=case.category,
+                    prompt_token_count=prompt_token_count,
+                    generated_token_count=generated_token_count,
+                    recovered_event_count=recovered_events,
+                    recovered_note_count=len(notes),
+                    parseable_note_rate=parseable_note_rate,
+                    note_marker_count=int(note_patterns["note_marker_count"]),
+                    complete_note_pattern_count=int(note_patterns["complete_note_pattern_count"]),
+                    complete_note_pattern_rate=float(note_patterns["complete_note_pattern_rate"]),
+                    recovery_rate=float(recovery_stats.get("recovery_rate", 0.0)),
+                    recovery_quality_score=float(recovery_stats.get("quality_score", 0.0)),
+                    scale_adherence=scale_adherence,
+                    prompt_pitch_coverage=prompt_pitch_coverage,
+                    out_of_scale_rate=out_of_scale_rate,
+                    rhythm_ioi_similarity=rhythm_ioi_similarity,
+                    rhythm_alignment=rhythm_alignment,
+                    rhythm_bar_phase_similarity=rhythm_bar_phase_similarity,
+                    overall=overall,
+                    generated_preview=continuation_text[:240],
+                    error=error,
+                )
             )
-            recovery_stats = language.analyze_parseable_continuation(continuation_text).to_dict()
-            recovered_doc = language.recover_continuation_document(
-                continuation_text,
-                metadata=dict(case.document.metadata),
-            )
-        except Exception as exc:
-            error = str(exc)
-        notes = _notes(recovered_doc)
-        note_patterns = note_pattern_metrics(continuation_text, language.name)
-        enough_notes = len(notes) >= min_notes
-        ppq = int(case.document.metadata.get("ppq", DEFAULT_PPQ))
-        scale_adherence, prompt_pitch_coverage, out_of_scale_rate = _pitch_metrics(case, notes, enough_notes)
-        rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity = _rhythm_metrics(case, notes, ppq, enough_notes)
-        category_scores = []
-        if case.category == "harmony":
-            category_scores.extend([scale_adherence, prompt_pitch_coverage])
-        if case.category == "rhythm":
-            category_scores.extend([rhythm_ioi_similarity, rhythm_alignment, rhythm_bar_phase_similarity])
-        overall = sum(category_scores) / len(category_scores) if category_scores else 0.0
-        recovered_events = int(recovery_stats.get("events_recovered", 0))
-        parseable_note_rate = len(notes) / max(1, recovered_events)
-        results.append(
-            MusicalEvalCaseResult(
-                name=case.name,
-                category=case.category,
-                prompt_token_count=prompt_token_count,
-                generated_token_count=generated_token_count,
-                recovered_event_count=recovered_events,
-                recovered_note_count=len(notes),
-                parseable_note_rate=parseable_note_rate,
-                note_marker_count=int(note_patterns["note_marker_count"]),
-                complete_note_pattern_count=int(note_patterns["complete_note_pattern_count"]),
-                complete_note_pattern_rate=float(note_patterns["complete_note_pattern_rate"]),
-                recovery_rate=float(recovery_stats.get("recovery_rate", 0.0)),
-                recovery_quality_score=float(recovery_stats.get("quality_score", 0.0)),
-                scale_adherence=scale_adherence,
-                prompt_pitch_coverage=prompt_pitch_coverage,
-                out_of_scale_rate=out_of_scale_rate,
-                rhythm_ioi_similarity=rhythm_ioi_similarity,
-                rhythm_alignment=rhythm_alignment,
-                rhythm_bar_phase_similarity=rhythm_bar_phase_similarity,
-                overall=overall,
-                generated_preview=continuation_text[:240],
-                error=error,
-            )
-        )
+        ## end of iterate over cases in music eval suite
     if model_was_training:
         model.train()
     return MusicalEvalRunResult(
