@@ -103,6 +103,12 @@ def njam_v4_grammar_state_for_text(text: str) -> str:
 
 
 def njam_v4_piece_is_allowed(base_token_ids: Sequence[int], state: str) -> bool:
+    """Return whether a full SentencePiece piece is legal from ``state``.
+
+    Args:
+        base_token_ids: NJam-v4 base-token ids contained inside one tokenizer piece.
+        state: Grammar state before the piece is emitted.
+    """
     if not base_token_ids:
         return state == FREE
     current = state
@@ -207,6 +213,13 @@ class NJamV4GrammarLogitsProcessor(LogitsProcessor):
 
 
 def build_generation_logits_processor(tokenizer, language_name: str, enabled: bool = True):
+    """Build optional generation constraints for the active language.
+
+    Args:
+        tokenizer: Project tokenizer adapter or compatible tokenizer.
+        language_name: Language adapter name, e.g. ``njam-v4``.
+        enabled: False returns no processors, preserving unconstrained generation.
+    """
     if enabled and language_name == "njam-v4":
         return [NJamV4GrammarLogitsProcessor(tokenizer)]
     return None

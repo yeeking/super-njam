@@ -464,6 +464,11 @@ class SoloSlidingWindowDatasetPartial(Dataset):
 
 
 def _parse_signature_ticks(metadata: Dict[str, str]) -> tuple[int, int, int]:
+    """Resolve PPQ, time-signature numerator, and bar length in ticks.
+
+    Args:
+        metadata: NJam document metadata, usually containing ``ppq`` and ``sig``.
+    """
     ppq = int(metadata.get("ppq", "96"))
     sig = str(metadata.get("sig", "4/4"))
     try:
@@ -597,6 +602,13 @@ class SoloMusicalWindowDatasetPartial(Dataset):
         return best
 
     def _build_candidates_for_text(self, text: str, tokenizer: SentencePieceTokenizerAdapter) -> List[List[int]]:
+        """Build tokenized bar-window candidates for one encoded solo.
+
+        Args:
+            text: Full NJam document text.
+            tokenizer: Run tokenizer used to turn each rebased subdocument body
+                into token ids.
+        """
         document = self.language.parse_document(text)
         sorted_events = document.sorted_events()
         if not sorted_events:
@@ -1176,6 +1188,18 @@ def build_sliding_window_dataset(
     musical_window_hop_bars: int = 1,
     min_window_notes: int = 8,
 ):
+    """Construct the requested train/validation dataset implementation.
+
+    Args:
+        texts: Full NJam documents for one split.
+        tokenizer: SentencePiece tokenizer adapter for the run.
+        seq_len: Model context length used for samples.
+        batch_size: DataLoader batch size; partial modes expose one batch per solo.
+        split_name: Human-readable split label for progress/errors.
+        mode: ``full``, ``partial``, ``partial-random``, or musical variants.
+        prep_workers: Worker count for exhaustive token-window preparation.
+        language: Active NJam language name.
+    """
     if mode == "full":
         return SoloSlidingWindowDataset(
             texts,

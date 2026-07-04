@@ -278,6 +278,13 @@ def _truncate_prompt_ids(tokenizer, ids: List[int], max_positions: int, max_new_
 
 
 def prepare_eval_prompt_text(language: MusicLanguage, document: NJamDocument) -> str:
+    """Encode a synthetic case as model prompt body text.
+
+    Args:
+        language: Active NJam language adapter.
+        document: Prompt document to encode. For NJam-v4 the terminal END base
+            token is removed so generation continues from the prompt.
+    """
     prompt_text = language.body_text(language.encode_document(document))
     if language.name == "njam-v4":
         from . import njam_v4
@@ -289,39 +296,6 @@ def prepare_eval_prompt_text(language: MusicLanguage, document: NJamDocument) ->
     return prompt_text
 
 
-def _generate_continuation(
-    model,
-    tokenizer,
-    language: MusicLanguage,
-    prompt_text: str,
-    max_new_tokens: int,
-    device: torch.device,
-    grammar_constrained_generation: bool = True,
-) -> tuple[str, int, int]:
-    max_positions = int(model.config.max_position_embeddings)
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-    prompt_ids = _truncate_prompt_ids(tokenizer, prompt_ids, max_positions=max_positions, max_new_tokens=max_new_tokens)
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    attention_mask = torch.ones_like(input_ids)
-    available_new_tokens = max(1, min(max_new_tokens, max_positions - int(input_ids.shape[1]) - 1))
-    with torch.no_grad():
-        generated = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=available_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            logits_processor=build_generation_logits_processor(
-                tokenizer,
-                language.name,
-                enabled=grammar_constrained_generation,
-            ),
-        )
-    continuation_ids = generated[0][int(input_ids.shape[1]) :]
-    return tokenizer.decode(continuation_ids, skip_special_tokens=True), int(input_ids.shape[1]), int(len(continuation_ids))
-
-
 def _generate_continuations_batch(
     model,
     tokenizer,
@@ -331,6 +305,17 @@ def _generate_continuations_batch(
     device: torch.device,
     grammar_constrained_generation: bool = True,
 ) -> List[tuple[str, int, int]]:
+    """Generate deterministic continuations for all musical eval prompts at once.
+
+    Args:
+        model: Hugging Face causal LM already placed on ``device``.
+        tokenizer: Project SentencePiece adapter.
+        language: Active language adapter, used to enable v4 grammar masks.
+        prompt_texts: Body-text prompts, one per musical eval case.
+        max_new_tokens: Upper bound for generated continuation tokens.
+        device: Torch device used for input tensors.
+        grammar_constrained_generation: Enables NJam-v4 grammar masking.
+    """
     if not prompt_texts:
         return []
     max_positions = int(model.config.max_position_embeddings)
@@ -394,6 +379,18 @@ def run_musical_eval(
     device: Optional[torch.device] = None,
     grammar_constrained_generation: bool = True,
 ) -> MusicalEvalRunResult:
+    """Run synthetic improvisation prompts and return musical metrics.
+
+    Args:
+        model: Hugging Face causal LM. Its training/eval mode is restored.
+        tokenizer: SentencePiece tokenizer adapter for the run.
+        language: Adapter or adapter name used for prompt encoding and recovery.
+        suite: Evaluation suite name; currently only ``light``.
+        max_new_tokens: Continuation length per prompt.
+        min_notes: Minimum recovered notes before harmony/rhythm scores count.
+        device: Optional explicit device; defaults to the model device.
+        grammar_constrained_generation: Enables NJam-v4 grammar masking.
+    """
     if isinstance(language, str):
         language = get_language(language)
     model_was_training = bool(getattr(model, "training", False))

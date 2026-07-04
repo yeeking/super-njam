@@ -10,6 +10,12 @@ from .njam_v3 import ContinuationRecoveryStats, NJamDocument
 
 
 class MusicLanguage(Protocol):
+    """Common interface for symbolic music language adapters.
+
+    Adapters translate between text corpora and the shared ``NJamDocument`` event
+    model so training, rendering, MIDI conversion, and evaluation can stay mostly
+    language-agnostic.
+    """
     name: str
     header_prefix: str
 
@@ -269,12 +275,25 @@ LANGUAGES: Dict[str, MusicLanguage] = {
 
 
 def get_language(name: str = "njam-v3") -> MusicLanguage:
+    """Return the registered language adapter by name.
+
+    Args:
+        name: One of ``njam-v2``, ``njam-v3``, or ``njam-v4``.
+    """
     normalized = name.strip().lower()
     assert normalized in LANGUAGES, f"Unsupported NJam language {name!r}. Expected one of: {', '.join(sorted(LANGUAGES))}"
     return LANGUAGES[normalized]
 
 
 def detect_language(text: str, default: str | None = "njam-v3") -> MusicLanguage:
+    """Detect a language adapter from an NJam header.
+
+    Args:
+        text: NJam text whose leading header may start with ``NV2|``, ``NV3|``,
+            or ``NV4|``.
+        default: Adapter name used for bare legacy text; ``None`` makes bare
+            text an error.
+    """
     stripped = text.lstrip()
     if stripped.startswith("NV2|"):
         return get_language("njam-v2")

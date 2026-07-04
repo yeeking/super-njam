@@ -1,60 +1,167 @@
 # Super NJam
 
-Minimal commands.
+Super NJam is a symbolic jazz-improvisation training pipeline. It converts music
+from Weimar Jazz Database solos or MIDI files into NJam text corpora, trains
+small llama-compatible causal language models, evaluates generated continuations,
+and exports trained models to GGUF for llama.cpp experiments.
 
-Setup:
+## Setup
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip setuptools wheel
-.venv/bin/pip install numpy mido pretty_midi tokenizers transformers sentencepiece torch lightning tensorboard pyfluidsynth tqdm tensorboard tensorboardx
+.venv/bin/pip install numpy mido pretty_midi tokenizers transformers sentencepiece torch lightning tensorboard pyfluidsynth tqdm tensorboardx
 ```
 
-Stage 1: corpus export and NJam/MIDI conversion:
+## NJam Languages
+
+The pipeline is language-adapter based. Use `--language` on corpus export,
+MIDI conversion, training, and evaluation commands.
+
+- `njam-v3`: default compact human-readable event text, used by older runs.
+- `njam-v2`: older, more human-readable token grammar, useful for MIDI-folder corpora and comparison runs.
+- `njam-v4`: structured base-token language. It stores fixed musical atoms as Unicode Private Use Area characters, then trains SentencePiece BPE over that stream. Pitches, velocity bins, CC numbers, CC value bins, bends, programs, durations, time shifts, and optional chord/root controls are atomic before BPE.
+
+NJam-v4 is the current recommended language for new grammar-stability experiments:
+
+```bash
+.venv/bin/python python/1_language.py export-corpus \
+  --language njam-v4 \
+  --db data/wjazzd.db \
+  --out artifacts/corpus-v4.jsonl \
+  --limit 32
+```
+
+To include all-key transpositions:
+
+```bash
+.venv/bin/python python/1_language.py export-corpus \
+  --language njam-v4 \
+  --db data/wjazzd.db \
+  --out artifacts/corpus-v4-all-keys.jsonl \
+  --limit 32 \
+  --permute-to-all-keys
+```
+
+To include optional Weimar chord/root conditioning tokens in NJam-v4:
+
+```bash
+.venv/bin/python python/1_language.py export-corpus \
+  --language njam-v4 \
+  --db data/wjazzd.db \
+  --out artifacts/corpus-v4-controls.jsonl \
+  --include-control-tokens
+```
+
+Control tokens are masked from loss when they appear in tokenizer pieces.
+
+## Corpus And MIDI Conversion
+
+Weimar corpus export:
 
 ```bash
 .venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus.jsonl --limit 32
-.venv/bin/python python/1_language.py export-corpus --db data/wjazzd.db --out artifacts/corpus_all_keys.jsonl --limit 32 --permute-to-all-keys
-.venv/bin/python python/7_midi_and_njam.py midi-demo --in "data/midi/ArtPepper_Anthropology_FINAL.mid" --out-dir outputs --render-audio --soundfont soundfonts/soundfont.sf2
 ```
 
-Stage 2: tokenizer comparison:
+MIDI folder corpus export:
 
 ```bash
-.venv/bin/python python/2_tokenizer.py --corpus artifacts/corpus.jsonl --out artifacts/tokenizers.json
+.venv/bin/python python/1_language.py export-midi-corpus \
+  --language njam-v4 \
+  --midi-dir data/midi \
+  --out artifacts/midi-corpus-v4.jsonl
 ```
 
-Stage 3: training:
+Single MIDI conversion:
 
 ```bash
-.venv/bin/python python/3_trainer.py --corpus artifacts/corpus.jsonl --output-dir artifacts/train_smoke --max-epochs 2 --seq-len 128
-.venv/bin/python python/3_trainer.py --corpus artifacts/corpus.jsonl --max-epochs 2 --seq-len 128
-.venv/bin/python python/3_trainer.py --corpus artifacts/corpus.jsonl --max-epochs 20 --seq-len 1024 --batch-size 16 --sample-limit 1 --sample-every-n-epochs 5 --instrument saxophone
-.venv/bin/python python/5_trainer_hyper.py --corpus artifacts/corpus.jsonl --output-dir artifacts/sweep --summary-out artifacts/sweep_summary.json --max-epochs 1 --seq-len 128
+.venv/bin/python python/1_language.py midi-to-njam --language njam-v4 --in data/midi/example.mid --out outputs/example.njam
+.venv/bin/python python/1_language.py njam-to-midi --in outputs/example.njam --out outputs/example.mid
+```
+
+Training uses SentencePiece. NJam-v4 uses BPE with identity normalization,
+`add_dummy_prefix=False`, `max_sentencepiece_length=32`, and a required base-token
+alphabet so all structural tokens remain representable.
+
+## Training
+
+Basic smoke:
+
+```bash
+.venv/bin/python python/3_trainer.py \
+  --language njam-v4 \
+  --corpus artifacts/corpus-v4.jsonl \
+  --output-dir artifacts/train_smoke_v4 \
+  --max-epochs 2 \
+  --seq-len 128
+```
+
+Longer run:
+
+```bash
+.venv/bin/python python/3_trainer.py \
+  --language njam-v4 \
+  --corpus artifacts/corpus-v4-all-keys.jsonl \
+  --max-epochs 20 \
+  --seq-len 1024 \
+  --batch-size 16 \
+  --sample-limit 1 \
+  --sample-every-n-epochs 5 \
+  --instrument saxophone
 ```
 
 Training notes:
 
-- Use `--permute-to-all-keys` during corpus export to include the original solo plus transposed copies at -5..-1 and +1..+6 semitones.
-- If `--output-dir` is omitted, the trainer creates a run folder under `artifacts/` from model settings and a timestamp.
-- Training now uses per-solo sliding windows only. Windows never cross solo boundaries.
-- Dataset windows train on NJam body/event tokens. Header metadata is still used for held-out rendering and recovery.
-- Dataset preparation is serial by default again, and the sliding-window dataset now stores lightweight token/range data with tensors created lazily in `__getitem__`.
-- Use `--dataset-prep-workers` only if you explicitly want parallel dataset preparation.
-- Use `--sample-every-n-epochs` to reduce validation sample generation frequency.
-- Validation renders default to `saxophone`.
+- If `--output-dir` is omitted, a timestamped run folder is created under `artifacts/`.
+- Header metadata is dropped from training windows but kept for rendering, recovery, and summaries.
+- Default `--dataset-mode partial` gives one batch per solo per epoch.
+- `--dataset-mode full` preserves exhaustive sliding-window epochs.
+- `--dataset-mode musical-partial` builds beat/bar-aware candidate windows, filters sparse windows with `--min-window-notes`, and keeps normal PyTorch one-item-per-`__getitem__` semantics.
+- Validation supports `partial-random`, `partial`, `full`, `musical-partial`, and `musical-partial-random`.
+- Validation preflight is on by default to catch validation-time OOM early.
+- Early stopping defaults to `val_loss` patience `3`.
+- Optimizer defaults use gradient accumulation `16`, weight decay `0.01`, max grad norm `1.0`, warmup steps `2000`, and a cosine LR schedule. Restore older behavior with `--gradient-accumulation-steps 1 --weight-decay 0 --max-grad-norm 0 --warmup-steps 0 --lr-scheduler constant`.
 
-Stage 4: GGUF export and C++ inference:
+## Musical Evaluation
+
+Training runs synthetic musical tests at validation epoch end by default. The
+light suite prompts the model with scale and rhythm fragments, then logs:
+
+- `musical_eval/overall`
+- `musical_eval/complete_note_pattern_rate`
+- `musical_eval/parseable_note_rate`
+- `musical_eval/harmony_scale_adherence`
+- `musical_eval/harmony_prompt_pitch_coverage`
+- `musical_eval/rhythm_ioi_similarity`
+- `musical_eval/rhythm_alignment`
+
+Standalone evaluation:
 
 ```bash
-.venv/bin/python python/5_exporter.py --ckpt artifacts/train_smoke/checkpoints/best.ckpt --output-dir artifacts/gguf --outfile model-f16.gguf --outtype f16
-.venv/bin/python python/6_exporter.py --model artifacts/gguf/model-f16.gguf --prompt-file sample_prompt.njam
+.venv/bin/python python/8_musical_eval.py \
+  --model-dir artifacts/train_smoke_v4 \
+  --max-new-tokens 192 \
+  --json-out artifacts/train_smoke_v4/musical_eval.json
 ```
 
-Export notes:
+For NJam-v4, Python generation uses grammar-constrained decoding by default.
+Disable it with `--no-grammar-constrained-generation` if you want to inspect raw
+model behavior. llama.cpp/GGUF generation does not yet apply the Python grammar
+mask.
 
-- `python/5_exporter.py` now infers the run folder from the checkpoint path and rebuilds the HF model automatically before GGUF conversion.
-- The exporter expects `llama.cpp` to be cloned under `libs/llama.cpp` and will fail early with a suggestion to check `libs/README.md` if it is missing.
+## GGUF Export And C++ Inference
+
+```bash
+.venv/bin/python python/5_exporter.py \
+  --ckpt artifacts/train_smoke_v4/checkpoints/best.ckpt \
+  --output-dir artifacts/gguf \
+  --outfile model-f16.gguf \
+  --outtype f16
+```
+
+The exporter infers the run folder from the checkpoint path and rebuilds the HF
+model before calling llama.cpp conversion. It expects `llama.cpp` under
+`libs/llama.cpp`.
 
 C++ smoke build:
 
@@ -66,11 +173,22 @@ cmake --build cplusplus/llamacpp-minimal-example/build
 C++ inference:
 
 ```bash
-./cplusplus/llamacpp-minimal-example/build/super-njam-cli -m artifacts/gguf/model-f16.gguf -p sample_prompt.njam -n 64 -o sample_output.njam
+./cplusplus/llamacpp-minimal-example/build/super-njam-cli \
+  -m artifacts/gguf/model-f16.gguf \
+  -p sample_prompt.njam \
+  -n 64 \
+  -o sample_output.njam
 ```
 
-Training output notes:
+## Training Outputs
 
-- `reference.*` files are one-time held-out target renders for comparison.
-- `generated_model_only.*` files are continuation-only renders.
-- If strict NJam parsing fails during training, the renderer tries to recover and render whatever valid events it can from the continuation text.
+- `train_summary.json`: resolved config, split/window stats, tokenizer info, optimizer settings, and dataset build stats.
+- `checkpoints/best.ckpt` and `checkpoints/last.ckpt`: Lightning checkpoints.
+- `hf_model/`: Hugging Face model plus tokenizer for Python inference/export.
+- `tensorboard/`: scalar logs, sample text, and optional audio previews.
+- `reference.*`: one-time held-out target renders.
+- `generated_model_only.*`: continuation-only renders.
+- `musical_eval_epoch_XXXX.json`: detailed synthetic musical evaluation results.
+
+If strict NJam parsing fails during sample rendering, the renderer tries to
+recover and render whatever valid continuation events it can.
